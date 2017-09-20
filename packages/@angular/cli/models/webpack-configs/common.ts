@@ -23,6 +23,8 @@ const CircularDependencyPlugin = require('circular-dependency-plugin');
  * require('url-loader')
  * require('file-loader')
  * require('@angular-devkit/build-optimizer')
+ * require('graphql')
+ * require('graphql-tag')
  */
 
 export function getCommonConfig(wco: WebpackConfigOptions) {
@@ -188,6 +190,11 @@ export function getCommonConfig(wco: WebpackConfigOptions) {
         {
           test: /\.(jpg|png|webp|gif|otf|ttf|woff|woff2|ani)$/,
           loader: `url-loader?name=[name]${hashFormat.file}.[ext]&limit=10000`
+        },
+        {
+          test: /\.(graphql|gql)$/,
+          exclude: /node_modules/,
+          loader: 'graphql-tag/loader'
         }
       ].concat(extraRules)
     },
