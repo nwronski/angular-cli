@@ -61,6 +61,8 @@
     "fs-extra": "^4.0.0",
     "get-caller-file": "^1.0.0",
     "glob": "^7.0.3",
+    "graphql": "^0.10.5",
+    "graphql-tag": "^2.4.2",
     "heimdalljs": "^0.2.4",
     "heimdalljs-logger": "^0.1.9",
     "html-webpack-plugin": "^2.29.0",
