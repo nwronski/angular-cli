@@ -28,7 +28,11 @@ function _fromPackageJson(cwd) {
       if (content) {
         const json = JSON.parse(content);
         if (json['version']) {
-          return new SemVer(json['version']);
+          if (json['version'].indexOf('nwronski') !== -1) {
+            return json['version'];
+          } else {
+            return new SemVer(json['version']);
+          }
         }
       }
     }
@@ -142,13 +146,20 @@ resolve('@angular/cli', { basedir: process.cwd() },
       Version.assertPostWebpackVersion();
 
       // This was run from a global, check local version.
-      const globalVersion = new SemVer(packageJson['version']);
+      let globalVersion;
+      
+      if (packageJson['version'] && packageJson['version'].indexOf('nwronski') !== -1) {
+        globalVersion = packageJson['version'];
+      } else {
+        globalVersion = new SemVer(packageJson['version']);
+      }
+      
       let localVersion;
       let shouldWarn = false;
 
       try {
         localVersion = _fromPackageJson();
-        shouldWarn = localVersion && globalVersion.compare(localVersion) > 0;
+        shouldWarn = localVersion && localVersion !== globalVersion && globalVersion.compare(localVersion) > 0;
       } catch (e) {
         console.error(e);
         shouldWarn = true;
