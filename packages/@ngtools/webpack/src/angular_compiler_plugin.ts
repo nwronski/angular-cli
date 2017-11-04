@@ -1,12 +1,10 @@
-// @ignoreDep @angular/compiler-cli
+// @ignoreDep typescript
 import * as fs from 'fs';
-import { fork, ChildProcess } from 'child_process';
+import { fork, ForkOptions, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as ts from 'typescript';
 
-const { __NGTOOLS_PRIVATE_API_2, VERSION } = require('@angular/compiler-cli');
 const ContextElementDependency = require('webpack/lib/dependencies/ContextElementDependency');
-const NodeWatchFileSystem = require('webpack/lib/node/NodeWatchFileSystem');
 const treeKill = require('tree-kill');
 
 import { WebpackResourceLoader } from './resource_loader';
@@ -14,21 +12,26 @@ import { WebpackCompilerHost } from './compiler_host';
 import { Tapable } from './webpack';
 import { PathsPlugin } from './paths-plugin';
 import { findLazyRoutes, LazyRouteMap } from './lazy_routes';
-import { VirtualFileSystemDecorator } from './virtual_file_system_decorator';
+import {
+  VirtualFileSystemDecorator,
+  VirtualWatchFileSystemDecorator
+} from './virtual_file_system_decorator';
 import { resolveEntryModuleFromMain } from './entry_resolver';
 import {
-  TransformOperation,
-  makeTransform,
   replaceBootstrap,
   exportNgFactory,
   exportLazyModuleMap,
   registerLocaleData,
+  findResources,
   replaceResources,
 } from './transformers';
 import { time, timeEnd } from './benchmark';
 import { InitMessage, UpdateMessage } from './type_checker';
 import { gatherDiagnostics, hasErrors } from './gather_diagnostics';
 import {
+  CompilerCliIsSupported,
+  __NGTOOLS_PRIVATE_API_2,
+  VERSION,
   DEFAULT_ERROR_CODE,
   UNKNOWN_ERROR_CODE,
   SOURCE,
@@ -36,12 +39,14 @@ import {
   CompilerOptions,
   CompilerHost,
   Diagnostics,
-  CustomTransformers,
+  EmitFlags,
+  LazyRoute,
   createProgram,
   createCompilerHost,
   formatDiagnostics,
-  EmitFlags,
-} from './ngtools_api2';
+  readConfiguration,
+} from './ngtools_api';
+import { collectDeepNodes } from './transformers/ast_helpers';
 
 
 /**
@@ -54,8 +59,10 @@ export interface AngularCompilerPluginOptions {
   entryModule?: string;
   mainPath?: string;
   skipCodeGeneration?: boolean;
-  hostOverrideFileSystem?: { [path: string]: string };
   hostReplacementPaths?: { [path: string]: string };
+  // TODO: remove singleFileIncludes for 2.0, this is just to support old projects that did not
+  // include 'polyfills.ts' in `tsconfig.spec.json'.
+  singleFileIncludes?: string[];
   i18nInFile?: string;
   i18nInFormat?: string;
   i18nOutFile?: string;
@@ -65,8 +72,6 @@ export interface AngularCompilerPluginOptions {
   platform?: PLATFORM;
 
   // Use tsconfig to include path globs.
-  exclude?: string | string[];
-  include?: string[];
   compilerOptions?: ts.CompilerOptions;
 }
 
@@ -79,41 +84,54 @@ export class AngularCompilerPlugin implements Tapable {
   private _options: AngularCompilerPluginOptions;
 
   // TS compilation.
-  private _compilerOptions: ts.CompilerOptions;
-  private _angularCompilerOptions: CompilerOptions;
-  private _tsFilenames: string[];
-  private _program: ts.Program | Program;
-  private _compilerHost: WebpackCompilerHost;
-  private _angularCompilerHost: WebpackCompilerHost & CompilerHost;
+  private _compilerOptions: CompilerOptions;
+  private _rootNames: string[];
+  private _singleFileIncludes: string[] = [];
+  private _program: (ts.Program | Program);
+  private _compilerHost: WebpackCompilerHost & CompilerHost;
+  private _moduleResolutionCache: ts.ModuleResolutionCache;
+  private _resourceLoader: WebpackResourceLoader;
   // Contains `moduleImportPath#exportName` => `fullModulePath`.
   private _lazyRoutes: LazyRouteMap = Object.create(null);
   private _tsConfigPath: string;
   private _entryModule: string;
+  private _mainPath: string | undefined;
   private _basePath: string;
-  private _transformMap: Map<string, TransformOperation[]> = new Map();
+  private _transformers: ts.TransformerFactory<ts.SourceFile>[] = [];
   private _platform: PLATFORM;
   private _JitMode = false;
+  private _emitSkipped = true;
 
   // Webpack plugin.
   private _firstRun = true;
   private _donePromise: Promise<void> | null;
   private _compiler: any = null;
   private _compilation: any = null;
-  private _failedCompilation = false;
 
   // TypeChecker process.
   private _forkTypeChecker = true;
   private _typeCheckerProcess: ChildProcess;
 
+  private get _ngCompilerSupportsNewApi() {
+    if (this._JitMode) {
+      return false;
+    } else {
+      return !!(this._program as Program).listLazyRoutes;
+    }
+  }
+
   constructor(options: AngularCompilerPluginOptions) {
+    CompilerCliIsSupported();
     this._options = Object.assign({}, options);
     this._setupOptions(this._options);
   }
 
   get options() { return this._options; }
   get done() { return this._donePromise; }
-  get failedCompilation() { return this._failedCompilation; }
   get entryModule() {
+    if (!this._entryModule) {
+      return undefined;
+    }
     const splitted = this._entryModule.split('#');
     const path = splitted[0];
     const className = splitted[1] || 'default';
@@ -121,7 +139,7 @@ export class AngularCompilerPlugin implements Tapable {
   }
 
   static isSupported() {
-    return parseInt(VERSION.major) >= 5;
+    return VERSION && parseInt(VERSION.major) >= 5;
   }
 
   private _setupOptions(options: AngularCompilerPluginOptions) {
@@ -143,59 +161,19 @@ export class AngularCompilerPlugin implements Tapable {
       basePath = path.resolve(process.cwd(), options.basePath);
     }
 
-    this._basePath = basePath;
-
-    // Read the tsconfig.
-    const configResult = ts.readConfigFile(this._tsConfigPath, ts.sys.readFile);
-    if (configResult.error) {
-      const diagnostic = configResult.error;
-      const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n');
-
-      if (diagnostic.file) {
-        const { line, character } = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start);
-        throw new Error(`${diagnostic.file.fileName} (${line + 1},${character + 1}): ${message})`);
-      } else {
-        throw new Error(message);
-      }
-    }
-
-    const tsConfigJson = configResult.config;
-
-    // Extend compilerOptions.
-    if (options.hasOwnProperty('compilerOptions')) {
-      tsConfigJson.compilerOptions = Object.assign({},
-        tsConfigJson.compilerOptions,
-        options.compilerOptions
-      );
-    }
-
-    // Default exclude to **/*.spec.ts files.
-    if (!options.hasOwnProperty('exclude')) {
-      options['exclude'] = ['**/*.spec.ts'];
-    }
-
-    // Add custom excludes to default TypeScript excludes.
-    if (options.hasOwnProperty('exclude')) {
-      // If the tsconfig doesn't contain any excludes, we must add the default ones before adding
-      // any extra ones (otherwise we'd include all of these which can cause unexpected errors).
-      // This is the same logic as present in TypeScript.
-      if (!tsConfigJson.exclude) {
-        tsConfigJson['exclude'] = ['node_modules', 'bower_components', 'jspm_packages'];
-        if (tsConfigJson.compilerOptions && tsConfigJson.compilerOptions.outDir) {
-          tsConfigJson.exclude.push(tsConfigJson.compilerOptions.outDir);
-        }
-      }
-
-      // Join our custom excludes with the existing ones.
-      tsConfigJson.exclude = tsConfigJson.exclude.concat(options.exclude);
+    if (options.singleFileIncludes !== undefined) {
+      this._singleFileIncludes.push(...options.singleFileIncludes);
     }
 
     // Parse the tsconfig contents.
-    const tsConfig = ts.parseJsonConfigFileContent(
-      tsConfigJson, ts.sys, basePath, undefined, this._tsConfigPath);
+    const config = readConfiguration(this._tsConfigPath);
+    if (config.errors && config.errors.length) {
+      throw new Error(formatDiagnostics(config.errors));
+    }
 
-    this._tsFilenames = tsConfig.fileNames;
-    this._compilerOptions = tsConfig.options;
+    this._rootNames = config.rootNames.concat(...this._singleFileIncludes);
+    this._compilerOptions = config.options;
+    this._basePath = config.options.basePath;
 
     // Overwrite outDir so we can find generated files next to their .ts origin in compilerHost.
     this._compilerOptions.outDir = '';
@@ -210,21 +188,22 @@ export class AngularCompilerPlugin implements Tapable {
       this._compilerOptions.sourceMap = true;
       this._compilerOptions.inlineSources = true;
       this._compilerOptions.inlineSourceMap = false;
-      this._compilerOptions.sourceRoot = basePath;
+      this._compilerOptions.mapRoot = undefined;
+      // We will set the source to the full path of the file in the loader, so we don't
+      // need sourceRoot here.
+      this._compilerOptions.sourceRoot = undefined;
     } else {
       this._compilerOptions.sourceMap = false;
       this._compilerOptions.sourceRoot = undefined;
       this._compilerOptions.inlineSources = undefined;
       this._compilerOptions.inlineSourceMap = undefined;
       this._compilerOptions.mapRoot = undefined;
+      this._compilerOptions.sourceRoot = undefined;
     }
 
-    // Compose Angular Compiler Options.
-    this._angularCompilerOptions = Object.assign(
-      this._compilerOptions,
-      tsConfig.raw['angularCompilerOptions'],
-      { basePath }
-    );
+    // We want to allow emitting with errors so that imports can be added
+    // to the webpack dependency tree and rebuilds triggered by file edits.
+    this._compilerOptions.noEmitOnError = false;
 
     // Set JIT (no code generation) or AOT mode.
     if (options.skipCodeGeneration !== undefined) {
@@ -232,46 +211,40 @@ export class AngularCompilerPlugin implements Tapable {
     }
 
     // Process i18n options.
-    if (options.hasOwnProperty('i18nInFile')) {
-      this._angularCompilerOptions.i18nInFile = options.i18nInFile;
+    if (options.i18nInFile !== undefined) {
+      this._compilerOptions.i18nInFile = options.i18nInFile;
     }
-    if (options.hasOwnProperty('i18nInFormat')) {
-      this._angularCompilerOptions.i18nInFormat = options.i18nInFormat;
+    if (options.i18nInFormat !== undefined) {
+      this._compilerOptions.i18nInFormat = options.i18nInFormat;
     }
-    if (options.hasOwnProperty('i18nOutFile')) {
-      this._angularCompilerOptions.i18nOutFile = options.i18nOutFile;
+    if (options.i18nOutFile !== undefined) {
+      this._compilerOptions.i18nOutFile = options.i18nOutFile;
     }
-    if (options.hasOwnProperty('i18nOutFormat')) {
-      this._angularCompilerOptions.i18nOutFormat = options.i18nOutFormat;
+    if (options.i18nOutFormat !== undefined) {
+      this._compilerOptions.i18nOutFormat = options.i18nOutFormat;
     }
-    if (options.hasOwnProperty('locale') && options.locale) {
-      this._angularCompilerOptions.i18nInLocale = this._validateLocale(options.locale);
+    if (options.locale !== undefined) {
+      this._compilerOptions.i18nInLocale = this._validateLocale(options.locale);
     }
-    if (options.hasOwnProperty('missingTranslation')) {
-      this._angularCompilerOptions.i18nInMissingTranslations =
+    if (options.missingTranslation !== undefined) {
+      this._compilerOptions.i18nInMissingTranslations =
         options.missingTranslation as 'error' | 'warning' | 'ignore';
     }
 
-    // Use entryModule if available in options, otherwise resolve it from mainPath after program
-    // creation.
-    if (this._options.entryModule) {
-      this._entryModule = this._options.entryModule;
-    } else if (this._angularCompilerOptions.entryModule) {
-      this._entryModule = path.resolve(this._basePath,
-        this._angularCompilerOptions.entryModule);
-    }
-
     // Create the webpack compiler host.
-    this._compilerHost = new WebpackCompilerHost(this._compilerOptions, this._basePath);
-    this._compilerHost.enableCaching();
+    const webpackCompilerHost = new WebpackCompilerHost(this._compilerOptions, this._basePath);
+    webpackCompilerHost.enableCaching();
 
-    // Override some files in the FileSystem.
-    if (this._options.hostOverrideFileSystem) {
-      for (const filePath of Object.keys(this._options.hostOverrideFileSystem)) {
-        this._compilerHost.writeFile(filePath,
-          this._options.hostOverrideFileSystem[filePath], false);
-      }
-    }
+    // Create and set a new WebpackResourceLoader.
+    this._resourceLoader = new WebpackResourceLoader();
+    webpackCompilerHost.setResourceLoader(this._resourceLoader);
+
+    // Use the WebpackCompilerHost with a resource loader to create an AngularCompilerHost.
+    this._compilerHost = createCompilerHost({
+      options: this._compilerOptions,
+      tsHost: webpackCompilerHost
+    }) as CompilerHost & WebpackCompilerHost;
+
     // Override some files in the FileSystem with paths from the actual file system.
     if (this._options.hostReplacementPaths) {
       for (const filePath of Object.keys(this._options.hostReplacementPaths)) {
@@ -281,7 +254,29 @@ export class AngularCompilerPlugin implements Tapable {
       }
     }
 
+    // Use an identity function as all our paths are absolute already.
+    this._moduleResolutionCache = ts.createModuleResolutionCache(this._basePath, x => x);
+
+    // Resolve mainPath if provided.
+    if (options.mainPath) {
+      this._mainPath = this._compilerHost.resolve(options.mainPath);
+    }
+
+    // Use entryModule if available in options, otherwise resolve it from mainPath after program
+    // creation.
+    if (this._options.entryModule) {
+      this._entryModule = this._options.entryModule;
+    } else if (this._compilerOptions.entryModule) {
+      this._entryModule = path.resolve(this._basePath,
+        this._compilerOptions.entryModule);
+    }
+
+    // Set platform.
     this._platform = options.platform || PLATFORM.Browser;
+
+    // Make transformers.
+    this._makeTransformers();
+
     timeEnd('AngularCompilerPlugin._setupOptions');
   }
 
@@ -295,48 +290,65 @@ export class AngularCompilerPlugin implements Tapable {
       .filter(k => this._compilerHost.fileExists(k));
   }
 
+  private _getChangedCompilationFiles() {
+    return this._compilerHost.getChangedFilePaths()
+      .filter(k => /\.(?:ts|html|css|scss|sass|less|styl)$/.test(k));
+  }
+
   private _createOrUpdateProgram() {
-    const changedTsFiles = this._getChangedTsFiles();
-    changedTsFiles.forEach((file) => {
-      if (!this._tsFilenames.includes(file)) {
-        // TODO: figure out if action is needed for files that were removed from the compilation.
-        this._tsFilenames.push(file);
-      }
-    });
+    return Promise.resolve()
+      .then(() => {
+        // Get the root files from the ts config.
+        // When a new root name (like a lazy route) is added, it won't be available from
+        // following imports on the existing files, so we need to get the new list of root files.
+        const config = readConfiguration(this._tsConfigPath);
+        this._rootNames = config.rootNames.concat(...this._singleFileIncludes);
 
-    // Update the forked type checker.
-    if (this._forkTypeChecker && !this._firstRun) {
-      this._updateForkedTypeChecker(changedTsFiles);
-    }
+        // Update the forked type checker with all changed compilation files.
+        // This includes templates, that also need to be reloaded on the type checker.
+        if (this._forkTypeChecker && !this._firstRun) {
+          this._updateForkedTypeChecker(this._rootNames, this._getChangedCompilationFiles());
+        }
 
-    if (this._JitMode) {
+        if (this._JitMode) {
+          // Create the TypeScript program.
+          time('AngularCompilerPlugin._createOrUpdateProgram.ts.createProgram');
+          this._program = ts.createProgram(
+            this._rootNames,
+            this._compilerOptions,
+            this._compilerHost,
+            this._program as ts.Program
+          );
+          timeEnd('AngularCompilerPlugin._createOrUpdateProgram.ts.createProgram');
 
-      // Create the TypeScript program.
-      time('AngularCompilerPlugin._createOrUpdateProgram.ts.createProgram');
-      this._program = ts.createProgram(
-        this._tsFilenames,
-        this._angularCompilerOptions,
-        this._angularCompilerHost,
-        this._program as ts.Program
-      );
-      timeEnd('AngularCompilerPlugin._createOrUpdateProgram.ts.createProgram');
+          return Promise.resolve();
+        } else {
+          time('AngularCompilerPlugin._createOrUpdateProgram.ng.createProgram');
+          // Create the Angular program.
+          this._program = createProgram({
+            rootNames: this._rootNames,
+            options: this._compilerOptions,
+            host: this._compilerHost,
+            oldProgram: this._program as Program
+          });
+          timeEnd('AngularCompilerPlugin._createOrUpdateProgram.ng.createProgram');
 
-      return Promise.resolve();
-    } else {
-      time('AngularCompilerPlugin._createOrUpdateProgram.ng.createProgram');
-      // Create the Angular program.
-      this._program = createProgram({
-        rootNames: this._tsFilenames,
-        options: this._angularCompilerOptions,
-        host: this._angularCompilerHost,
-        oldProgram: this._program as Program
+          time('AngularCompilerPlugin._createOrUpdateProgram.ng.loadNgStructureAsync');
+          return this._program.loadNgStructureAsync()
+            .then(() => {
+              timeEnd('AngularCompilerPlugin._createOrUpdateProgram.ng.loadNgStructureAsync');
+            });
+        }
+      })
+      .then(() => {
+        // If there's still no entryModule try to resolve from mainPath.
+        if (!this._entryModule && this._mainPath) {
+          time('AngularCompilerPlugin._make.resolveEntryModuleFromMain');
+          this._entryModule = resolveEntryModuleFromMain(
+            this._mainPath, this._compilerHost, this._getTsProgram());
+          timeEnd('AngularCompilerPlugin._make.resolveEntryModuleFromMain');
+        }
       });
-      timeEnd('AngularCompilerPlugin._createOrUpdateProgram.ng.createProgram');
-
-      time('AngularCompilerPlugin._createOrUpdateProgram.ng.loadNgStructureAsync');
-      return this._program.loadNgStructureAsync().then(() =>
-        timeEnd('AngularCompilerPlugin._createOrUpdateProgram.ng.loadNgStructureAsync'));
-    }
   }
 
   private _getLazyRoutesFromNgtools() {
@@ -345,7 +357,7 @@ export class AngularCompilerPlugin implements Tapable {
       const result = __NGTOOLS_PRIVATE_API_2.listLazyRoutes({
         program: this._getTsProgram(),
         host: this._compilerHost,
-        angularCompilerOptions: Object.assign({}, this._angularCompilerOptions, {
+        angularCompilerOptions: Object.assign({}, this._compilerOptions, {
           // genDir seems to still be needed in @angular\compiler-cli\src\compiler_host.js:226.
           genDir: ''
         }),
@@ -377,6 +389,32 @@ export class AngularCompilerPlugin implements Tapable {
     }
     timeEnd('AngularCompilerPlugin._findLazyRoutesInAst');
     return result;
+  }
+
+  private _listLazyRoutesFromProgram(): LazyRouteMap {
+    const ngProgram = this._program as Program;
+    if (!ngProgram.listLazyRoutes) {
+      throw new Error('_listLazyRoutesFromProgram was called with an old program.');
+    }
+
+    const lazyRoutes = ngProgram.listLazyRoutes();
+
+    return lazyRoutes.reduce(
+      (acc: LazyRouteMap, curr: LazyRoute) => {
+        const ref = curr.route;
+        if (ref in acc && acc[ref] !== curr.referencedModule.filePath) {
+          throw new Error(
+            + `Duplicated path in loadChildren detected: "${ref}" is used in 2 loadChildren, `
+            + `but they point to different modules "(${acc[ref]} and `
+            + `"${curr.referencedModule.filePath}"). Webpack cannot distinguish on context and `
+            + 'would fail to load the proper one.'
+          );
+        }
+        acc[ref] = curr.referencedModule.filePath;
+        return acc;
+      },
+      {} as LazyRouteMap
+    );
   }
 
   // Process the lazy routes discovered, adding then to _lazyRoutes.
@@ -413,10 +451,8 @@ export class AngularCompilerPlugin implements Tapable {
             );
           }
         } else {
-          // Found a new route, add it to the map and read it into the compiler host.
+          // Found a new route, add it to the map.
           this._lazyRoutes[moduleKey] = modulePath;
-          this._angularCompilerHost.readFile(lazyRouteTSFile);
-          this._angularCompilerHost.invalidate(lazyRouteTSFile);
         }
       });
   }
@@ -428,19 +464,32 @@ export class AngularCompilerPlugin implements Tapable {
       ? './type_checker_bootstrap.js'
       : './type_checker.js';
 
-    this._typeCheckerProcess = fork(path.resolve(__dirname, typeCheckerFile));
+    const debugArgRegex = /--inspect(?:-brk|-port)?|--debug(?:-brk|-port)/;
+
+    const execArgv = process.execArgv.filter((arg) => {
+      // Remove debug args.
+      // Workaround for https://github.com/nodejs/node/issues/9435
+      return !debugArgRegex.test(arg);
+    });
+
+    const forkOptions: ForkOptions = { execArgv };
+
+    this._typeCheckerProcess = fork(path.resolve(__dirname, typeCheckerFile), [], forkOptions);
     this._typeCheckerProcess.send(new InitMessage(this._compilerOptions, this._basePath,
-      this._JitMode, this._tsFilenames));
+      this._JitMode, this._rootNames));
 
     // Cleanup.
-    const killTypeCheckerProcess = () => treeKill(this._typeCheckerProcess.pid, 'SIGTERM');
-    process.on('exit', killTypeCheckerProcess);
-    process.on('SIGINT', killTypeCheckerProcess);
-    process.on('uncaughtException', killTypeCheckerProcess);
+    const killTypeCheckerProcess = () => {
+      treeKill(this._typeCheckerProcess.pid, 'SIGTERM');
+      process.exit();
+    };
+    process.once('exit', killTypeCheckerProcess);
+    process.once('SIGINT', killTypeCheckerProcess);
+    process.once('uncaughtException', killTypeCheckerProcess);
   }
 
-  private _updateForkedTypeChecker(changedTsFiles: string[]) {
-    this._typeCheckerProcess.send(new UpdateMessage(changedTsFiles));
+  private _updateForkedTypeChecker(rootNames: string[], changedCompilationFiles: string[]) {
+    this._typeCheckerProcess.send(new UpdateMessage(rootNames, changedCompilationFiles));
   }
 
 
@@ -453,7 +502,7 @@ export class AngularCompilerPlugin implements Tapable {
     compiler.plugin('environment', () => {
       compiler.inputFileSystem = new VirtualFileSystemDecorator(
         compiler.inputFileSystem, this._compilerHost);
-      compiler.watchFileSystem = new NodeWatchFileSystem(compiler.inputFileSystem);
+      compiler.watchFileSystem = new VirtualWatchFileSystemDecorator(compiler.inputFileSystem);
     });
 
     // Add lazy modules to the context module for @angular/core
@@ -522,7 +571,6 @@ export class AngularCompilerPlugin implements Tapable {
     compiler.plugin('done', () => {
       this._donePromise = null;
       this._compilation = null;
-      this._failedCompilation = false;
     });
 
     // TODO: consider if it's better to remove this plugin and instead make it wait on the
@@ -554,176 +602,140 @@ export class AngularCompilerPlugin implements Tapable {
   private _make(compilation: any, cb: (err?: any, request?: any) => void) {
     time('AngularCompilerPlugin._make');
     this._compilation = compilation;
+    this._emitSkipped = true;
     if (this._compilation._ngToolsWebpackPluginInstance) {
       return cb(new Error('An @ngtools/webpack plugin already exist for this compilation.'));
     }
 
+    // Set a private variable for this plugin instance.
     this._compilation._ngToolsWebpackPluginInstance = this;
 
-    // Create the resource loader with the webpack compilation.
-    time('AngularCompilerPlugin._make.setResourceLoader');
-    const resourceLoader = new WebpackResourceLoader(compilation);
-    this._compilerHost.setResourceLoader(resourceLoader);
-    timeEnd('AngularCompilerPlugin._make.setResourceLoader');
+    // Update the resource loader with the new webpack compilation.
+    this._resourceLoader.update(compilation);
+
+    // Create a new process for the type checker on the second build if there isn't one yet.
+    if (this._forkTypeChecker && !this._firstRun && !this._typeCheckerProcess) {
+      this._createForkedTypeChecker();
+    }
 
     this._donePromise = Promise.resolve()
-      .then(() => {
-        // Create a new process for the type checker.
-        if (!this._firstRun && !this._typeCheckerProcess) {
-          this._createForkedTypeChecker();
-        }
-      })
-      .then(() => {
-        if (this._firstRun) {
-          // Use the WebpackResourceLoader with a resource loader to create an AngularCompilerHost.
-          this._angularCompilerHost = createCompilerHost({
-            options: this._angularCompilerOptions,
-            tsHost: this._compilerHost
-          }) as CompilerHost & WebpackCompilerHost;
-
-          return this._createOrUpdateProgram()
-            .then(() => {
-              // If there's still no entryModule try to resolve from mainPath.
-              if (!this._entryModule && this._options.mainPath) {
-                time('AngularCompilerPlugin._make.resolveEntryModuleFromMain');
-                const mainPath = path.resolve(this._basePath, this._options.mainPath);
-                this._entryModule = resolveEntryModuleFromMain(
-                  mainPath, this._compilerHost, this._getTsProgram());
-                timeEnd('AngularCompilerPlugin._make.resolveEntryModuleFromMain');
-              }
-            });
-        }
-      })
       .then(() => this._update())
       .then(() => {
         timeEnd('AngularCompilerPlugin._make');
         cb();
       }, (err: any) => {
-        this._failedCompilation = true;
         compilation.errors.push(err.stack);
         timeEnd('AngularCompilerPlugin._make');
         cb();
       });
   }
 
+  private _makeTransformers() {
+
+    const isAppPath = (fileName: string) =>
+      !fileName.endsWith('.ngfactory.ts') && !fileName.endsWith('.ngstyle.ts');
+    const isMainPath = (fileName: string) => fileName === this._mainPath;
+    const getEntryModule = () => this.entryModule;
+    const getLazyRoutes = () => this._lazyRoutes;
+
+    if (this._JitMode) {
+      // Replace resources in JIT.
+      this._transformers.push(replaceResources(isAppPath));
+    }
+
+    if (this._platform === PLATFORM.Browser) {
+      // If we have a locale, auto import the locale data file.
+      // This transform must go before replaceBootstrap because it looks for the entry module
+      // import, which will be replaced.
+      if (this._compilerOptions.i18nInLocale) {
+        this._transformers.push(registerLocaleData(isAppPath, getEntryModule,
+          this._compilerOptions.i18nInLocale));
+      }
+
+      if (!this._JitMode) {
+        // Replace bootstrap in browser AOT.
+        this._transformers.push(replaceBootstrap(isAppPath, getEntryModule));
+      }
+    } else if (this._platform === PLATFORM.Server) {
+      this._transformers.push(exportLazyModuleMap(isMainPath, getLazyRoutes));
+      if (!this._JitMode) {
+        this._transformers.push(exportNgFactory(isMainPath, getEntryModule));
+      }
+    }
+  }
+
   private _update() {
+    time('AngularCompilerPlugin._update');
     // We only want to update on TS and template changes, but all kinds of files are on this
     // list, like package.json and .ngsummary.json files.
-    time('AngularCompilerPlugin._update');
-    let changedFiles = this._compilerHost.getChangedFilePaths()
-      .filter(k => /(ts|html|css|scss|sass|less|styl)/.test(k));
+    let changedFiles = this._getChangedCompilationFiles();
+
+    // If nothing we care about changed and it isn't the first run, don't do anything.
+    if (changedFiles.length === 0 && !this._firstRun) {
+      return Promise.resolve();
+    }
 
     return Promise.resolve()
+      // Make a new program and load the Angular structure.
+      .then(() => this._createOrUpdateProgram())
       .then(() => {
-        // Try to find lazy routes.
-        // We need to run the `listLazyRoutes` the first time because it also navigates libraries
-        // and other things that we might miss using the (faster) findLazyRoutesInAst.
-        // Lazy routes modules will be read with compilerHost and added to the changed files.
-        const changedTsFiles = this._compilerHost.getChangedFilePaths()
-          .filter(k => k.endsWith('.ts'));
-        if (this._firstRun) {
-          this._processLazyRoutes(this._getLazyRoutesFromNgtools());
-        } else if (changedTsFiles.length > 0) {
-          this._processLazyRoutes(this._findLazyRoutesInAst(changedTsFiles));
+        if (this.entryModule) {
+          // Try to find lazy routes if we have an entry module.
+          // We need to run the `listLazyRoutes` the first time because it also navigates libraries
+          // and other things that we might miss using the (faster) findLazyRoutesInAst.
+          // Lazy routes modules will be read with compilerHost and added to the changed files.
+          const changedTsFiles = this._getChangedTsFiles();
+          if (this._ngCompilerSupportsNewApi) {
+            this._processLazyRoutes(this._listLazyRoutesFromProgram());
+          } else if (this._firstRun) {
+            this._processLazyRoutes(this._getLazyRoutesFromNgtools());
+          } else if (changedTsFiles.length > 0) {
+            this._processLazyRoutes(this._findLazyRoutesInAst(changedTsFiles));
+          }
         }
       })
       .then(() => {
-        // Make a new program and load the Angular structure if there are changes.
-        if (changedFiles.length > 0) {
-          return this._createOrUpdateProgram();
+        // Emit and report errors.
+
+        // We now have the final list of changed TS files.
+        // Go through each changed file and add transforms as needed.
+        const sourceFiles = this._getChangedTsFiles()
+          .map((fileName) => this._getTsProgram().getSourceFile(fileName))
+          // At this point we shouldn't need to filter out undefined files, because any ts file
+          // that changed should be emitted.
+          // But due to hostReplacementPaths there can be files (the environment files)
+          // that changed but aren't part of the compilation, specially on `ng test`.
+          // So we ignore missing source files files here.
+          // hostReplacementPaths needs to be fixed anyway to take care of the following issue.
+          // https://github.com/angular/angular-cli/issues/7305#issuecomment-332150230
+          .filter((x) => !!x);
+
+        // Emit files.
+        time('AngularCompilerPlugin._update._emit');
+        const { emitResult, diagnostics } = this._emit(sourceFiles);
+        timeEnd('AngularCompilerPlugin._update._emit');
+
+        // Report diagnostics.
+        const errors = diagnostics
+          .filter((diag) => diag.category === ts.DiagnosticCategory.Error);
+        const warnings = diagnostics
+          .filter((diag) => diag.category === ts.DiagnosticCategory.Warning);
+
+        if (errors.length > 0) {
+          const message = formatDiagnostics(errors);
+          this._compilation.errors.push(message);
         }
-      })
-      .then(() => {
-        // Build transforms, emit and report errors if there are changes or it's the first run.
-        if (changedFiles.length > 0 || this._firstRun) {
 
-          // We now have the final list of changed TS files.
-          // Go through each changed file and add transforms as needed.
-          const sourceFiles = this._getChangedTsFiles().map((fileName) => {
-            time('AngularCompilerPlugin._update.getSourceFile');
-            const sourceFile = this._getTsProgram().getSourceFile(fileName);
-            if (!sourceFile) {
-              throw new Error(`${fileName} is not part of the TypeScript compilation. `
-                + `Please include it in your tsconfig via the 'files' or 'include' property.`);
-            }
-            timeEnd('AngularCompilerPlugin._update.getSourceFile');
-            return sourceFile;
-          });
+        if (warnings.length > 0) {
+          const message = formatDiagnostics(warnings);
+          this._compilation.warnings.push(message);
+        }
 
-          time('AngularCompilerPlugin._update.transformOps');
-          sourceFiles.forEach((sf) => {
-            const fileName = this._compilerHost.resolve(sf.fileName);
-            let transformOps = [];
+        this._emitSkipped = !emitResult || emitResult.emitSkipped;
 
-            if (this._JitMode) {
-              transformOps.push(...replaceResources(sf));
-            }
-
-            if (this._platform === PLATFORM.Browser) {
-              if (!this._JitMode) {
-                transformOps.push(...replaceBootstrap(sf, this.entryModule));
-              }
-
-              // If we have a locale, auto import the locale data file.
-              if (this._angularCompilerOptions.i18nInLocale) {
-                transformOps.push(...registerLocaleData(
-                  sf,
-                  this.entryModule,
-                  this._angularCompilerOptions.i18nInLocale
-                ));
-              }
-            } else if (this._platform === PLATFORM.Server) {
-              if (fileName === this._compilerHost.resolve(this._options.mainPath)) {
-                transformOps.push(...exportLazyModuleMap(sf, this._lazyRoutes));
-                if (!this._JitMode) {
-                  transformOps.push(...exportNgFactory(sf, this.entryModule));
-                }
-              }
-            }
-
-            // We need to keep a map of transforms for each file, to reapply on each update.
-            this._transformMap.set(fileName, transformOps);
-          });
-
-          const transformOps: TransformOperation[] = [];
-          for (let fileTransformOps of this._transformMap.values()) {
-            transformOps.push(...fileTransformOps);
-          }
-          timeEnd('AngularCompilerPlugin._update.transformOps');
-
-          time('AngularCompilerPlugin._update.makeTransform');
-          const transformers: CustomTransformers = {
-            beforeTs: transformOps.length > 0 ? [makeTransform(transformOps)] : []
-          };
-          timeEnd('AngularCompilerPlugin._update.makeTransform');
-
-          // Emit files.
-          time('AngularCompilerPlugin._update._emit');
-          const { emitResult, diagnostics } = this._emit(sourceFiles, transformers);
-          timeEnd('AngularCompilerPlugin._update._emit');
-
-          // Report diagnostics.
-          const errors = diagnostics
-            .filter((diag) => diag.category === ts.DiagnosticCategory.Error);
-          const warnings = diagnostics
-            .filter((diag) => diag.category === ts.DiagnosticCategory.Warning);
-
-          if (errors.length > 0) {
-            const message = formatDiagnostics(this._angularCompilerOptions, errors);
-            this._compilation.errors.push(message);
-          }
-
-          if (warnings.length > 0) {
-            const message = formatDiagnostics(this._angularCompilerOptions, warnings);
-            this._compilation.warnings.push(message);
-          }
-
-          // Reset changed files on successful compilation.
-          if (emitResult && !emitResult.emitSkipped && this._compilation.errors.length === 0) {
-            this._compilerHost.resetChangedFileTracker();
-          } else {
-            this._failedCompilation = true;
-          }
+        // Reset changed files on successful compilation.
+        if (!this._emitSkipped && this._compilation.errors.length === 0) {
+          this._compilerHost.resetChangedFileTracker();
         }
         timeEnd('AngularCompilerPlugin._update');
       });
@@ -740,7 +752,7 @@ export class AngularCompilerPlugin implements Tapable {
     }
 
     // Write the extracted messages to disk.
-    const i18nOutFilePath = path.resolve(this._basePath, this._angularCompilerOptions.i18nOutFile);
+    const i18nOutFilePath = path.resolve(this._basePath, this._compilerOptions.i18nOutFile);
     const i18nOutFileContent = this._compilerHost.readFile(i18nOutFilePath);
     if (i18nOutFileContent) {
       _recursiveMkDir(path.dirname(i18nOutFilePath))
@@ -748,21 +760,91 @@ export class AngularCompilerPlugin implements Tapable {
     }
   }
 
-  getFile(fileName: string) {
+  getCompiledFile(fileName: string) {
     const outputFile = fileName.replace(/.ts$/, '.js');
-    return {
-      outputText: this._compilerHost.readFile(outputFile),
-      sourceMap: this._compilerHost.readFile(outputFile + '.map')
-    };
+    let outputText: string;
+    let sourceMap: string;
+    let errorDependencies: string[] = [];
+
+    if (this._emitSkipped) {
+      if (this._compilerHost.fileExists(outputFile, false)) {
+        // If the compilation didn't emit files this time, try to return the cached files from the
+        // last compilation and let the compilation errors show what's wrong.
+        outputText = this._compilerHost.readFile(outputFile);
+        sourceMap = this._compilerHost.readFile(outputFile + '.map');
+      } else {
+        // There's nothing we can serve. Return an empty string to prevent lenghty webpack errors,
+        // add the rebuild warning if it's not there yet.
+        // We also need to all changed files as dependencies of this file, so that all of them
+        // will be watched and trigger a rebuild next time.
+        outputText = '';
+        errorDependencies = this._getChangedCompilationFiles()
+          // These paths are used by the loader so we must denormalize them.
+          .map((p) => this._compilerHost.denormalizePath(p));
+      }
+    } else {
+      // Check if the TS file exists.
+      if (fileName.endsWith('.ts') && !this._compilerHost.fileExists(fileName, false)) {
+        throw new Error(`${fileName} is not part of the compilation. `
+          + `Please make sure it is in your tsconfig via the 'files' or 'include' property.`);
+      }
+
+      // Check if the output file exists.
+      if (!this._compilerHost.fileExists(outputFile, false)) {
+        throw new Error(`${fileName} is not part of the compilation output. `
+          + `Please check the other error messages for details.`);
+      }
+
+      outputText = this._compilerHost.readFile(outputFile);
+      sourceMap = this._compilerHost.readFile(outputFile + '.map');
+    }
+    return { outputText, sourceMap, errorDependencies };
+  }
+
+  getDependencies(fileName: string): string[] {
+    const resolvedFileName = this._compilerHost.resolve(fileName);
+    const sourceFile = this._compilerHost.getSourceFile(resolvedFileName, ts.ScriptTarget.Latest);
+    if (!sourceFile) {
+      return [];
+    }
+
+    const options = this._compilerOptions;
+    const host = this._compilerHost;
+    const cache = this._moduleResolutionCache;
+
+    const esImports = collectDeepNodes<ts.ImportDeclaration>(sourceFile,
+      ts.SyntaxKind.ImportDeclaration)
+      .map(decl => {
+        const moduleName = (decl.moduleSpecifier as ts.StringLiteral).text;
+        const resolved = ts.resolveModuleName(moduleName, resolvedFileName, options, host, cache);
+
+        if (resolved.resolvedModule) {
+          return resolved.resolvedModule.resolvedFileName;
+        } else {
+          return null;
+        }
+      })
+      .filter(x => x);
+
+    const resourceImports = findResources(sourceFile)
+      .map((resourceReplacement) => resourceReplacement.resourcePaths)
+      .reduce((prev, curr) => prev.concat(curr), [])
+      .map((resourcePath) => path.resolve(path.dirname(resolvedFileName), resourcePath))
+      .reduce((prev, curr) =>
+        prev.concat(...this.getResourceDependencies(curr)), []);
+
+    // These paths are meant to be used by the loader so we must denormalize them.
+    return [...esImports, ...resourceImports].map((p) => this._compilerHost.denormalizePath(p));
+  }
+
+  getResourceDependencies(fileName: string): string[] {
+    return this._resourceLoader.getResourceDependencies(fileName);
   }
 
   // This code mostly comes from `performCompilation` in `@angular/compiler-cli`.
   // It skips the program creation because we need to use `loadNgStructureAsync()`,
   // and uses CustomTransformers.
-  private _emit(
-    sourceFiles: ts.SourceFile[],
-    customTransformers: ts.CustomTransformers & CustomTransformers
-  ) {
+  private _emit(sourceFiles: ts.SourceFile[]) {
     time('AngularCompilerPlugin._emit');
     const program = this._program;
     const allDiagnostics: Diagnostics = [];
@@ -781,7 +863,7 @@ export class AngularCompilerPlugin implements Tapable {
 
         if (this._firstRun || !this._forkTypeChecker) {
           allDiagnostics.push(...gatherDiagnostics(this._program, this._JitMode,
-            'AngularCompilerPluginOptions'));
+            'AngularCompilerPlugin._emit.ts'));
         }
 
         if (!hasErrors(allDiagnostics)) {
@@ -789,7 +871,7 @@ export class AngularCompilerPlugin implements Tapable {
             const timeLabel = `AngularCompilerPlugin._emit.ts+${sf.fileName}+.emit`;
             time(timeLabel);
             emitResult = tsProgram.emit(sf, undefined, undefined, undefined,
-              { before: customTransformers.beforeTs }
+              { before: this._transformers }
             );
             allDiagnostics.push(...emitResult.diagnostics);
             timeEnd(timeLabel);
@@ -797,6 +879,11 @@ export class AngularCompilerPlugin implements Tapable {
         }
       } else {
         const angularProgram = program as Program;
+
+        // Check Angular structural diagnostics.
+        time('AngularCompilerPlugin._emit.ng.getNgStructuralDiagnostics');
+        allDiagnostics.push(...angularProgram.getNgStructuralDiagnostics());
+        timeEnd('AngularCompilerPlugin._emit.ng.getNgStructuralDiagnostics');
 
         if (this._firstRun) {
           // Check TypeScript parameter diagnostics.
@@ -812,14 +899,18 @@ export class AngularCompilerPlugin implements Tapable {
 
         if (this._firstRun || !this._forkTypeChecker) {
           allDiagnostics.push(...gatherDiagnostics(this._program, this._JitMode,
-            'AngularCompilerPluginOptions'));
+            'AngularCompilerPlugin._emit.ng'));
         }
 
         if (!hasErrors(allDiagnostics)) {
           time('AngularCompilerPlugin._emit.ng.emit');
-          const extractI18n = !!this._angularCompilerOptions.i18nOutFile;
+          const extractI18n = !!this._compilerOptions.i18nOutFile;
           const emitFlags = extractI18n ? EmitFlags.I18nBundle : EmitFlags.Default;
-          emitResult = angularProgram.emit({ emitFlags, customTransformers });
+          emitResult = angularProgram.emit({
+            emitFlags, customTransformers: {
+              beforeTs: this._transformers
+            }
+          });
           allDiagnostics.push(...emitResult.diagnostics);
           if (extractI18n) {
             this.writeI18nOutFile();

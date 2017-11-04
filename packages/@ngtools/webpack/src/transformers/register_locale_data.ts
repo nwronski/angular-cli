@@ -1,84 +1,91 @@
+// @ignoreDep typescript
 import * as ts from 'typescript';
 
-import { findAstNodes, getFirstNode } from './ast_helpers';
-import { AddNodeOperation, TransformOperation } from './make_transform';
+import { collectDeepNodes, getFirstNode } from './ast_helpers';
+import { StandardTransform, AddNodeOperation, TransformOperation } from './interfaces';
+import { insertStarImport } from './insert_import';
+import { makeTransform } from './make_transform';
 
 
 export function registerLocaleData(
-  sourceFile: ts.SourceFile,
-  entryModule: { path: string, className: string },
+  shouldTransform: (fileName: string) => boolean,
+  getEntryModule: () => { path: string, className: string },
   locale: string
-): TransformOperation[] {
-  const ops: TransformOperation[] = [];
+): ts.TransformerFactory<ts.SourceFile> {
 
-  // Find all identifiers using the entry module class name.
-  const entryModuleIdentifiers = findAstNodes<ts.Identifier>(null, sourceFile,
-    ts.SyntaxKind.Identifier, true)
-    .filter(identifier => identifier.getText() === entryModule.className);
+  const standardTransform: StandardTransform = function (sourceFile: ts.SourceFile) {
+    const ops: TransformOperation[] = [];
 
-  if (entryModuleIdentifiers.length === 0) {
-    return [];
-  }
+    const entryModule = getEntryModule();
 
-  // Find the bootstrap call
-  entryModuleIdentifiers.forEach(entryModuleIdentifier => {
-    // Figure out if it's a `platformBrowserDynamic().bootstrapModule(AppModule)` call.
-    if (!(
+    if (!shouldTransform(sourceFile.fileName) || !entryModule || !locale) {
+      return ops;
+    }
+
+    // Find all identifiers using the entry module class name.
+    const entryModuleIdentifiers = collectDeepNodes<ts.Identifier>(sourceFile,
+      ts.SyntaxKind.Identifier)
+      .filter(identifier => identifier.text === entryModule.className);
+
+    if (entryModuleIdentifiers.length === 0) {
+      return [];
+    }
+
+    // Find the bootstrap call
+    entryModuleIdentifiers.forEach(entryModuleIdentifier => {
+      // Figure out if it's a `platformBrowserDynamic().bootstrapModule(AppModule)` call.
+      if (!(
         entryModuleIdentifier.parent
         && entryModuleIdentifier.parent.kind === ts.SyntaxKind.CallExpression
       )) {
-      return;
-    }
+        return;
+      }
 
-    const callExpr = entryModuleIdentifier.parent as ts.CallExpression;
+      const callExpr = entryModuleIdentifier.parent as ts.CallExpression;
 
-    if (callExpr.expression.kind !== ts.SyntaxKind.PropertyAccessExpression) {
-      return;
-    }
+      if (callExpr.expression.kind !== ts.SyntaxKind.PropertyAccessExpression) {
+        return;
+      }
 
-    const propAccessExpr = callExpr.expression as ts.PropertyAccessExpression;
+      const propAccessExpr = callExpr.expression as ts.PropertyAccessExpression;
 
-    if (propAccessExpr.name.text !== 'bootstrapModule'
-      || propAccessExpr.expression.kind !== ts.SyntaxKind.CallExpression) {
-      return;
-    }
+      if (propAccessExpr.name.text !== 'bootstrapModule'
+        || propAccessExpr.expression.kind !== ts.SyntaxKind.CallExpression) {
+        return;
+      }
 
-    // Create the import node for the locale.
-    const localeIdentifier = ts.createIdentifier(`__locale_${locale.replace(/-/g, '')}__`);
-    const localeImportClause = ts.createImportClause(localeIdentifier, undefined);
-    const localeNewImport = ts.createImportDeclaration(undefined, undefined, localeImportClause,
-      ts.createLiteral(`@angular/common/locales/${locale}`));
+      const firstNode = getFirstNode(sourceFile);
 
-    ops.push(new AddNodeOperation(
-      sourceFile,
-      getFirstNode(sourceFile),
-      localeNewImport
-    ));
+      // Create the import node for the locale.
+      const localeNamespaceId = ts.createUniqueName('__NgCli_locale_');
+      ops.push(...insertStarImport(
+        sourceFile, localeNamespaceId, `@angular/common/locales/${locale}`, firstNode, true
+      ));
 
-    // Create the import node for the registerLocaleData function.
-    const regIdentifier = ts.createIdentifier(`registerLocaleData`);
-    const regImportSpecifier = ts.createImportSpecifier(undefined, regIdentifier);
-    const regNamedImport = ts.createNamedImports([regImportSpecifier]);
-    const regImportClause = ts.createImportClause(undefined, regNamedImport);
-    const regNewImport = ts.createImportDeclaration(undefined, undefined, regImportClause,
-      ts.createLiteral('@angular/common'));
+      // Create the import node for the registerLocaleData function.
+      const regIdentifier = ts.createIdentifier(`registerLocaleData`);
+      const regNamespaceId = ts.createUniqueName('__NgCli_locale_');
+      ops.push(
+        ...insertStarImport(sourceFile, regNamespaceId, '@angular/common', firstNode, true)
+      );
 
-    ops.push(new AddNodeOperation(
-      sourceFile,
-      getFirstNode(sourceFile),
-      regNewImport
-    ));
+      // Create the register function call
+      const registerFunctionCall = ts.createCall(
+        ts.createPropertyAccess(regNamespaceId, regIdentifier),
+        undefined,
+        [ts.createPropertyAccess(localeNamespaceId, 'default')],
+      );
+      const registerFunctionStatement = ts.createStatement(registerFunctionCall);
 
-    // Create the register function call
-    const registerFunctionCall = ts.createCall(regIdentifier, undefined, [localeIdentifier]);
-    const registerFunctionStatement = ts.createStatement(registerFunctionCall);
+      ops.push(new AddNodeOperation(
+        sourceFile,
+        firstNode,
+        registerFunctionStatement,
+      ));
+    });
 
-    ops.push(new AddNodeOperation(
-      sourceFile,
-      getFirstNode(sourceFile),
-      registerFunctionStatement
-    ));
-  });
+    return ops;
+  };
 
-  return ops;
+  return makeTransform(standardTransform);
 }

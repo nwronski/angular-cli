@@ -1,5 +1,5 @@
 import {SemVer, satisfies} from 'semver';
-import {bold, red, yellow} from 'chalk';
+import chalk from 'chalk';
 import {stripIndents, stripIndent} from 'common-tags';
 import {readFileSync, existsSync} from 'fs';
 import * as path from 'path';
@@ -10,6 +10,8 @@ import {requireProjectModule} from '../utilities/require-project-module';
 
 const resolve = require('resolve');
 
+
+const { bold, red, yellow } = chalk;
 
 function _hasOldCliBuildFile() {
   return existsSync(findUp('angular-cli-build.js', process.cwd()))
@@ -167,7 +169,7 @@ export class Version {
     const versionCombos = [
       { compiler: '>=2.3.1 <3.0.0', typescript: '>=2.0.2 <2.3.0' },
       { compiler: '>=4.0.0 <5.0.0', typescript: '>=2.1.0 <2.4.0' },
-      { compiler: '>=5.0.0 <6.0.0', typescript: '>=2.4.0 <2.6.0' }
+      { compiler: '>=5.0.0 <6.0.0', typescript: '>=2.4.2 <2.5.0' }
     ];
 
     const currentCombo = versionCombos.find((combo) => satisfies(compilerVersion, combo.compiler));

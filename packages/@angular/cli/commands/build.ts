@@ -2,7 +2,6 @@ import { CliConfig } from '../models/config';
 import { BuildOptions } from '../models/build-options';
 import { Version } from '../upgrade/version';
 import { oneLine } from 'common-tags';
-import { AngularCompilerPlugin } from '@ngtools/webpack';
 
 const Command = require('../ember-cli/lib/models/command');
 
@@ -167,9 +166,7 @@ export const baseBuildCommandOptions: any = [
   {
     name: 'build-optimizer',
     type: Boolean,
-    default: false,
-    description: '(Experimental) Enables @angular-devkit/build-optimizer '
-    + 'optimizations when using `--aot`.'
+    description: 'Enables @angular-devkit/build-optimizer optimizations when using `--aot`.'
   },
   {
     name: 'named-chunks',
@@ -179,18 +176,18 @@ export const baseBuildCommandOptions: any = [
     default: buildConfigDefaults['namedChunks']
   },
   {
-    name: 'experimental-angular-compiler',
-    type: Boolean,
-    // aliases: ['eac'],  // We should not have shorthand aliases for experimental flags.
-    description: '(Experimental) Use new Angular Compiler (Angular version 5 and greater only).',
-    default: AngularCompilerPlugin.isSupported()
-  },
-  {
     name: 'subresource-integrity',
     type: Boolean,
     default: false,
     aliases: ['sri'],
     description: 'Enables the use of subresource integrity validation.'
+  },
+  {
+    name: 'bundle-dependencies',
+    type: ['none', 'all'],
+    default: 'none',
+    description: 'Available on server platform only. Which external dependencies to bundle into '
+               + 'the module. By default, all of node_modules will be kept as requires.'
   }
 ];
 
@@ -218,9 +215,9 @@ const BuildCommand = Command.extend({
     Version.assertAngularVersionIs2_3_1OrHigher(this.project.root);
     Version.assertTypescriptVersion(this.project.root);
 
-    // Default vendor chunk to false when build optimizer is on.
-    if (commandOptions.vendorChunk === undefined) {
-      commandOptions.vendorChunk = !commandOptions.buildOptimizer;
+    // Force commonjs module format for TS on dev watch builds.
+    if (commandOptions.target === 'development' && commandOptions.watch === true) {
+      commandOptions.forceTsCommonjs = true;
     }
 
     const BuildTask = require('../tasks/build').default;

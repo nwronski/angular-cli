@@ -1,9 +1,17 @@
 import { normalize } from 'path';
 
 import { updateJsonFile, updateTsConfig } from '../../utils/project';
-import { expectFileToMatch, writeFile, replaceInFile, prependToFile } from '../../utils/fs';
+import {
+  expectFileToMatch,
+  writeFile,
+  replaceInFile,
+  prependToFile,
+  appendToFile,
+} from '../../utils/fs';
 import { ng, silentNpm, exec } from '../../utils/process';
 import { getGlobalVariable } from '../../utils/env';
+import { readNgVersion } from '../../utils/version';
+import { expectToFail } from '../../utils/utils';
 
 export default function () {
   // Skip this in Appveyor tests.
@@ -16,7 +24,7 @@ export default function () {
     return Promise.resolve();
   }
 
-  let platformServerVersion = '^4.0.0';
+  let platformServerVersion = readNgVersion();
 
   if (getGlobalVariable('argv').nightly) {
     platformServerVersion = 'github:angular/platform-server-builds';
@@ -34,6 +42,7 @@ export default function () {
       dependencies['@angular/platform-server'] = platformServerVersion;
     }))
     .then(() => updateTsConfig(tsConfig => {
+      tsConfig.compilerOptions.types = ['node'];
       tsConfig['angularCompilerOptions'] = {
         entryModule: 'app/app.module#AppModule'
       };
@@ -44,10 +53,10 @@ export default function () {
     .then(() => replaceInFile('./src/app/app.module.ts', /\[\s*BrowserModule/g,
       `[BrowserModule.withServerTransition(\{ appId: 'app' \}), ServerModule`))
     .then(() => silentNpm('install'))
-    .then(() => ng('build'))
+    .then(() => ng('build', '--aot=false'))
     // files were created successfully
     .then(() => expectFileToMatch('dist/main.bundle.js',
-      /__webpack_exports__, "AppModule"/))
+      /exports.*AppModule/))
     .then(() => writeFile('./index.js', `
       require('zone.js/dist/zone-node');
       require('reflect-metadata');
@@ -68,10 +77,33 @@ export default function () {
     .then(() => ng('build', '--aot'))
     // files were created successfully
     .then(() => expectFileToMatch('dist/main.bundle.js',
-      /__webpack_exports__, "AppModuleNgFactory"/))
+      /exports.*AppModuleNgFactory/))
     .then(() => replaceInFile('./index.js', /AppModule/g, 'AppModuleNgFactory'))
     .then(() => replaceInFile('./index.js', /renderModule/g, 'renderModuleFactory'))
     .then(() => exec(normalize('node'), 'index.js'))
     .then(() => expectFileToMatch('dist/index.html',
-      new RegExp('<h2 _ngcontent-c0="">Here are some links to help you start: </h2>')));
+      new RegExp('<h2 _ngcontent-c0="">Here are some links to help you start: </h2>')))
+    .then(() => expectFileToMatch('./dist/main.bundle.js',
+      /require\(["']@angular\/[^"']*["']\)/))
+
+    // Check externals.
+    .then(() => prependToFile('./src/app/app.module.ts', `
+      import 'zone.js/dist/zone-node';
+      import 'reflect-metadata';
+    `)
+    .then(() => appendToFile('./src/app/app.module.ts', `
+      import * as fs from 'fs';
+      import { renderModule } from '@angular/platform-server';
+
+      renderModule(AppModule, \{
+        url: '/',
+        document: '<app-root></app-root>'
+      \}).then(html => \{
+        fs.writeFileSync('dist/index.html', html);
+      \});
+    `)))
+    .then(() => ng('build', '--bundle-dependencies=all', '--aot=false'))
+    .then(() => expectToFail(() => expectFileToMatch('./dist/main.bundle.js',
+      /require\(["']@angular\/[^"']*["']\)/)))
+    .then(() => exec(normalize('node'), 'dist/main.bundle.js'));
 }

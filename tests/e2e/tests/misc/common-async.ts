@@ -1,9 +1,8 @@
 import {readdirSync} from 'fs';
 import {oneLine} from 'common-tags';
 
-import {ng, npm} from '../../utils/process';
-import {addImportToModule} from '../../utils/ast';
-import {appendToFile, expectFileToExist} from '../../utils/fs';
+import {ng, silentNpm} from '../../utils/process';
+import {appendToFile, expectFileToExist, prependToFile, replaceInFile} from '../../utils/fs';
 import {expectToFail} from '../../utils/utils';
 
 
@@ -14,10 +13,13 @@ export default function() {
     .then(() => oldNumberOfFiles = readdirSync('dist').length)
     .then(() => ng('generate', 'module', 'lazyA', '--routing'))
     .then(() => ng('generate', 'module', 'lazyB', '--routing'))
-    .then(() => addImportToModule('src/app/app.module.ts', oneLine`
+    .then(() => prependToFile('src/app/app.module.ts', `
+      import { RouterModule } from '@angular/router';
+    `))
+    .then(() => replaceInFile('src/app/app.module.ts', 'imports: [', `imports: [
       RouterModule.forRoot([{ path: "lazyA", loadChildren: "./lazy-a/lazy-a.module#LazyAModule" }]),
-      RouterModule.forRoot([{ path: "lazyB", loadChildren: "./lazy-b/lazy-b.module#LazyBModule" }])
-      `, '@angular/router'))
+      RouterModule.forRoot([{ path: "lazyB", loadChildren: "./lazy-b/lazy-b.module#LazyBModule" }]),
+    `))
     .then(() => ng('build'))
     .then(() => readdirSync('dist').length)
     .then(currentNumberOfDistFiles => {
@@ -26,7 +28,7 @@ export default function() {
       }
       oldNumberOfFiles = currentNumberOfDistFiles;
     })
-    .then(() => npm('install', 'moment'))
+    .then(() => silentNpm('install', 'moment'))
     .then(() => appendToFile('src/app/lazy-a/lazy-a.module.ts', `
       import * as moment from 'moment';
       console.log(moment);

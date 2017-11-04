@@ -1,10 +1,8 @@
-// @ignoreDep @angular/compiler-cli
 import * as ts from 'typescript';
 import * as path from 'path';
 import * as fs from 'fs';
 
-const {__NGTOOLS_PRIVATE_API_2, VERSION} = require('@angular/compiler-cli');
-
+import {__NGTOOLS_PRIVATE_API_2, VERSION} from './ngtools_api';
 import {Tapable} from './webpack';
 import {WebpackResourceLoader} from './resource_loader';
 
@@ -138,6 +136,8 @@ export class ExtractI18nPlugin implements Tapable {
       }
       this._outFile = options.outFile;
     }
+
+    this._resourceLoader = new WebpackResourceLoader();
   }
 
   apply(compiler: any) {
@@ -166,7 +166,7 @@ export class ExtractI18nPlugin implements Tapable {
 
     this._compilation._ngToolsWebpackXi18nPluginInstance = this;
 
-    this._resourceLoader = new WebpackResourceLoader(compilation);
+    this._resourceLoader.update(compilation);
 
     this._donePromise = Promise.resolve()
       .then(() => {

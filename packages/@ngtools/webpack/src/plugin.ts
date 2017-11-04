@@ -1,13 +1,13 @@
-// @ignoreDep @angular/compiler-cli
+// @ignoreDep typescript
 import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
 import * as SourceMap from 'source-map';
 
-const {__NGTOOLS_PRIVATE_API_2, VERSION} = require('@angular/compiler-cli');
 const ContextElementDependency = require('webpack/lib/dependencies/ContextElementDependency');
 const NodeWatchFileSystem = require('webpack/lib/node/NodeWatchFileSystem');
 
+import {CompilerCliIsSupported, __NGTOOLS_PRIVATE_API_2, VERSION} from './ngtools_api';
 import {WebpackResourceLoader} from './resource_loader';
 import {WebpackCompilerHost} from './compiler_host';
 import {resolveEntryModuleFromMain} from './entry_resolver';
@@ -52,6 +52,7 @@ export class AotPlugin implements Tapable {
   private _compilerOptions: ts.CompilerOptions;
   private _angularCompilerOptions: any;
   private _program: ts.Program;
+  private _moduleResolutionCache?: ts.ModuleResolutionCache;
   private _rootFilePath: string[];
   private _compilerHost: WebpackCompilerHost;
   private _resourceLoader: WebpackResourceLoader;
@@ -63,7 +64,6 @@ export class AotPlugin implements Tapable {
   private _donePromise: Promise<void> | null;
   private _compiler: any = null;
   private _compilation: any = null;
-  private _failedCompilation = false;
 
   private _typeCheck = true;
   private _skipCodeGeneration = false;
@@ -80,6 +80,7 @@ export class AotPlugin implements Tapable {
   private _firstRun = true;
 
   constructor(options: AotPluginOptions) {
+    CompilerCliIsSupported();
     this._options = Object.assign({}, options);
     this._setupOptions(this._options);
   }
@@ -90,7 +91,6 @@ export class AotPlugin implements Tapable {
   get compilerHost() { return this._compilerHost; }
   get compilerOptions() { return this._compilerOptions; }
   get done() { return this._donePromise; }
-  get failedCompilation() { return this._failedCompilation; }
   get entryModule() {
     const splitted = this._entryModule.split('#');
     const path = splitted[0];
@@ -99,6 +99,7 @@ export class AotPlugin implements Tapable {
   }
   get genDir() { return this._genDir; }
   get program() { return this._program; }
+  get moduleResolutionCache() { return this._moduleResolutionCache; }
   get skipCodeGeneration() { return this._skipCodeGeneration; }
   get replaceExport() { return this._replaceExport; }
   get typeCheck() { return this._typeCheck; }
@@ -252,9 +253,19 @@ export class AotPlugin implements Tapable {
     this._program = ts.createProgram(
       this._rootFilePath, this._compilerOptions, this._compilerHost);
 
+    // We use absolute paths everywhere.
+    if (ts.createModuleResolutionCache) {
+      this._moduleResolutionCache = ts.createModuleResolutionCache(
+        this._basePath,
+        (fileName: string) => this._compilerHost.resolve(fileName),
+      );
+    }
+
     // We enable caching of the filesystem in compilerHost _after_ the program has been created,
     // because we don't want SourceFile instances to be cached past this point.
     this._compilerHost.enableCaching();
+
+    this._resourceLoader = new WebpackResourceLoader();
 
     if (options.entryModule) {
       this._entryModule = options.entryModule;
@@ -426,7 +437,6 @@ export class AotPlugin implements Tapable {
     compiler.plugin('done', () => {
       this._donePromise = null;
       this._compilation = null;
-      this._failedCompilation = false;
     });
 
     compiler.plugin('after-resolvers', (compiler: any) => {
@@ -533,7 +543,7 @@ export class AotPlugin implements Tapable {
 
     this._compilation._ngToolsWebpackPluginInstance = this;
 
-    this._resourceLoader = new WebpackResourceLoader(compilation);
+    this._resourceLoader.update(compilation);
 
     this._donePromise = Promise.resolve()
       .then(() => {
@@ -638,14 +648,11 @@ export class AotPlugin implements Tapable {
       .then(() => {
         if (this._compilation.errors == 0) {
           this._compilerHost.resetChangedFileTracker();
-        } else {
-          this._failedCompilation = true;
         }
 
         timeEnd('AotPlugin._make');
         cb();
       }, (err: any) => {
-        this._failedCompilation = true;
         compilation.errors.push(err.stack);
         timeEnd('AotPlugin._make');
         cb();

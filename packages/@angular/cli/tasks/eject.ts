@@ -1,14 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as ts from 'typescript';
 import * as webpack from 'webpack';
+import chalk from 'chalk';
 
 import { getAppFromConfig } from '../utilities/app-utils';
 import { EjectTaskOptions } from '../commands/eject';
 import { NgCliWebpackConfig } from '../models/webpack-config';
 import { CliConfig } from '../models/config';
+import { stripBom } from '../utilities/strip-bom';
 import { AotPlugin, AngularCompilerPlugin } from '@ngtools/webpack';
-import { yellow } from 'chalk';
+import { PurifyPlugin } from '@angular-devkit/build-optimizer';
 import { LicenseWebpackPlugin } from 'license-webpack-plugin';
 
 import denodeify = require('denodeify');
@@ -34,6 +35,7 @@ const ProgressPlugin = require('webpack/lib/ProgressPlugin');
 export const pluginArgs = Symbol('plugin-args');
 export const postcssArgs = Symbol('postcss-args');
 
+const yellow = chalk.yellow;
 const pree2eNpmScript = `webdriver-manager update --standalone false --gecko false --quiet`;
 
 
@@ -226,6 +228,9 @@ class JsonWebpackSerializer {
         case AotPlugin:
           args = this._aotPluginSerialize(plugin);
           this._addImport('@ngtools/webpack', 'AotPlugin');
+          break;
+        case PurifyPlugin:
+          this._addImport('@angular-devkit/build-optimizer', 'PurifyPlugin');
           break;
         case AngularCompilerPlugin:
           args = this._aotPluginSerialize(plugin);
@@ -510,7 +515,7 @@ export default Task.extend({
       })
       // Read the package.json and update it to include npm scripts. We do this first so that if
       // an error already exists
-      .then(() => ts.sys.readFile('package.json'))
+      .then(() => stripBom(fs.readFileSync('package.json', 'utf-8')))
       .then((packageJson: string) => JSON.parse(packageJson))
       .then((packageJson: any) => {
         const scripts = packageJson['scripts'];
@@ -586,7 +591,7 @@ export default Task.extend({
 
         return writeFile('package.json', JSON.stringify(packageJson, null, 2) + '\n');
       })
-      .then(() => JSON.parse(ts.sys.readFile(tsConfigPath)))
+      .then(() => JSON.parse(stripBom(fs.readFileSync(tsConfigPath, 'utf-8'))))
       .then((tsConfigJson: any) => {
         if (!tsConfigJson.exclude || force) {
           // Make sure we now include tests.  Do not touch otherwise.

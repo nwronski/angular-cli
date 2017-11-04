@@ -2,17 +2,28 @@ import { WebpackConfigOptions } from '../webpack-config';
 
 /**
  * Returns a partial specific to creating a bundle for node
- * @param _wco Options which are include the build options and app config
+ * @param wco Options which are include the build options and app config
  */
-export function getServerConfig(_wco: WebpackConfigOptions) {
-  return {
+export function getServerConfig(wco: WebpackConfigOptions) {
+
+  const config: any = {
+    resolve: {
+      mainFields: [
+        ...(wco.supportES2015 ? ['es2015'] : []),
+        'main', 'module',
+      ],
+    },
     target: 'node',
     output: {
       libraryTarget: 'commonjs'
     },
-    externals: [
+    node: false,
+  };
+
+  if (wco.buildOptions.bundleDependencies == 'none') {
+    config.externals = [
       /^@angular/,
-      function (_: any, request: any, callback: (error?: any, result?: any) => void) {
+      (_: any, request: any, callback: (error?: any, result?: any) => void) => {
         // Absolute & Relative paths are not externals
         if (request.match(/^\.{0,2}\//)) {
           return callback();
@@ -33,6 +44,8 @@ export function getServerConfig(_wco: WebpackConfigOptions) {
           callback();
         }
       }
-    ]
-  };
+    ];
+  }
+
+  return config;
 }

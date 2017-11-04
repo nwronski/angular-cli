@@ -1,19 +1,17 @@
 import * as webpack from 'webpack';
 import * as path from 'path';
 import * as CopyWebpackPlugin from 'copy-webpack-plugin';
-import * as ts from 'typescript';
 import { NamedLazyChunksWebpackPlugin } from '../../plugins/named-lazy-chunks-webpack-plugin';
 import { InsertConcatAssetsWebpackPlugin } from '../../plugins/insert-concat-assets-webpack-plugin';
 import { extraEntryParser, getOutputHashFormat, AssetPattern } from './utils';
 import { isDirectory } from '../../utilities/is-directory';
+import { requireProjectModule } from '../../utilities/require-project-module';
 import { WebpackConfigOptions } from '../webpack-config';
-import { readTsconfig } from '../../utilities/read-tsconfig';
 
 const ConcatPlugin = require('webpack-concat-plugin');
 const ProgressPlugin = require('webpack/lib/ProgressPlugin');
 const CircularDependencyPlugin = require('circular-dependency-plugin');
 const SilentError = require('silent-error');
-
 
 /**
  * Enumerate loaders and their dependencies from this file to let the dependency validator
@@ -161,21 +159,23 @@ export function getCommonConfig(wco: WebpackConfigOptions) {
     extraPlugins.push(new NamedLazyChunksWebpackPlugin());
   }
 
-  // Read the tsconfig to determine if we should prefer ES2015 modules.
-  const tsconfigPath = path.resolve(projectRoot, appConfig.root, appConfig.tsconfig);
-  const tsConfig = readTsconfig(tsconfigPath);
-  const supportES2015 = tsConfig.options.target !== ts.ScriptTarget.ES3
-    && tsConfig.options.target !== ts.ScriptTarget.ES5;
+  // Load rxjs path aliases.
+  // https://github.com/ReactiveX/rxjs/blob/master/doc/lettable-operators.md#build-and-treeshaking
+  let alias = {};
+  try {
+    const rxjsPathMappingImport = wco.supportES2015
+      ? 'rxjs/_esm2015/path-mapping'
+      : 'rxjs/_esm5/path-mapping';
+    const rxPaths = requireProjectModule(projectRoot, rxjsPathMappingImport);
+    alias = rxPaths(nodeModules);
+  } catch (e) { }
 
   return {
     resolve: {
       extensions: ['.ts', '.js'],
       modules: ['node_modules', nodeModules],
-      mainFields: [
-        ...(supportES2015 ? ['es2015'] : []),
-        'browser', 'module', 'main'
-      ],
-      symlinks: !buildOptions.preserveSymlinks
+      symlinks: !buildOptions.preserveSymlinks,
+      alias
     },
     resolveLoader: {
       modules: [nodeModules, 'node_modules']
@@ -190,14 +190,22 @@ export function getCommonConfig(wco: WebpackConfigOptions) {
     },
     module: {
       rules: [
-        { enforce: 'pre', test: /\.js$/, loader: 'source-map-loader', exclude: [
-          nodeModules, /\.ngfactory\.js$/, /\.ngstyle\.js$/
-        ] },
         { test: /\.html$/, loader: 'raw-loader' },
-        { test: /\.(eot|svg|cur)$/, loader: `file-loader?name=[name]${hashFormat.file}.[ext]` },
+        {
+          test: /\.(eot|svg|cur)$/,
+          loader: 'file-loader',
+          options: {
+            name: `[name]${hashFormat.file}.[ext]`,
+            limit: 10000
+          }
+        },
         {
           test: /\.(jpg|png|webp|gif|otf|ttf|woff|woff2|ani)$/,
-          loader: `url-loader?name=[name]${hashFormat.file}.[ext]&limit=10000`
+          loader: 'url-loader',
+          options: {
+            name: `[name]${hashFormat.file}.[ext]`,
+            limit: 10000
+          }
         },
         {
           test: /\.(graphql|gql)$/,
@@ -208,19 +216,6 @@ export function getCommonConfig(wco: WebpackConfigOptions) {
     },
     plugins: [
       new webpack.NoEmitOnErrorsPlugin()
-    ].concat(extraPlugins),
-    node: {
-      fs: 'empty',
-      // `global` should be kept true, removing it resulted in a
-      // massive size increase with Build Optimizer on AIO.
-      global: true,
-      crypto: 'empty',
-      tls: 'empty',
-      net: 'empty',
-      process: true,
-      module: false,
-      clearImmediate: false,
-      setImmediate: false
-    }
+    ].concat(extraPlugins)
   };
 }

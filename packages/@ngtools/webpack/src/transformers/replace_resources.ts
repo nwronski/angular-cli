@@ -1,22 +1,73 @@
+// @ignoreDep typescript
 import * as ts from 'typescript';
 
-import { findAstNodes, getFirstNode } from './ast_helpers';
+import { collectDeepNodes, getFirstNode } from './ast_helpers';
+import { makeTransform } from './make_transform';
 import {
+  StandardTransform,
   AddNodeOperation,
   ReplaceNodeOperation,
   TransformOperation
-} from './make_transform';
+} from './interfaces';
 
 
-export function replaceResources(sourceFile: ts.SourceFile): TransformOperation[] {
-  const ops: TransformOperation[] = [];
+export function replaceResources(
+  shouldTransform: (fileName: string) => boolean
+): ts.TransformerFactory<ts.SourceFile> {
+  const standardTransform: StandardTransform = function (sourceFile: ts.SourceFile) {
+    const ops: TransformOperation[] = [];
+
+    if (!shouldTransform(sourceFile.fileName)) {
+      return ops;
+    }
+
+    const replacements = findResources(sourceFile);
+
+    if (replacements.length > 0) {
+
+      // Add the replacement operations.
+      ops.push(...(replacements.map((rep) => rep.replaceNodeOperation)));
+
+      // If we added a require call, we need to also add typings for it.
+      // The typings need to be compatible with node typings, but also work by themselves.
+
+      // interface NodeRequire {(id: string): any;}
+      const nodeRequireInterface = ts.createInterfaceDeclaration([], [], 'NodeRequire', [], [], [
+        ts.createCallSignature([], [
+          ts.createParameter([], [], undefined, 'id', undefined,
+            ts.createKeywordTypeNode(ts.SyntaxKind.StringKeyword)
+          )
+        ], ts.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword))
+      ]);
+
+      // declare var require: NodeRequire;
+      const varRequire = ts.createVariableStatement(
+        [ts.createToken(ts.SyntaxKind.DeclareKeyword)],
+        [ts.createVariableDeclaration('require', ts.createTypeReferenceNode('NodeRequire', []))]
+      );
+
+      ops.push(new AddNodeOperation(sourceFile, getFirstNode(sourceFile), nodeRequireInterface));
+      ops.push(new AddNodeOperation(sourceFile, getFirstNode(sourceFile), varRequire));
+    }
+
+    return ops;
+  };
+
+  return makeTransform(standardTransform);
+}
+
+export interface ResourceReplacement {
+  resourcePaths: string[];
+  replaceNodeOperation: ReplaceNodeOperation;
+}
+
+export function findResources(sourceFile: ts.SourceFile): ResourceReplacement[] {
+  const replacements: ResourceReplacement[] = [];
 
   // Find all object literals.
-  findAstNodes<ts.ObjectLiteralExpression>(null, sourceFile,
-    ts.SyntaxKind.ObjectLiteralExpression, true)
+  collectDeepNodes<ts.ObjectLiteralExpression>(sourceFile, ts.SyntaxKind.ObjectLiteralExpression)
     // Get all their property assignments.
-    .map(node => findAstNodes<ts.PropertyAssignment>(node, sourceFile,
-      ts.SyntaxKind.PropertyAssignment))
+    .map(node => collectDeepNodes<ts.PropertyAssignment>(node, ts.SyntaxKind.PropertyAssignment))
     // Flatten into a single array (from an array of array<property assignments>).
     .reduce((prev, curr) => curr ? prev.concat(curr) : prev, [])
     // We only want property assignments for the templateUrl/styleUrls keys.
@@ -33,12 +84,16 @@ export function replaceResources(sourceFile: ts.SourceFile): TransformOperation[
       const key = _getContentOfKeyLiteral(node.name);
 
       if (key == 'templateUrl') {
-        const requireCall = _createRequireCall(_getResourceRequest(node.initializer, sourceFile));
+        const resourcePath = _getResourceRequest(node.initializer, sourceFile);
+        const requireCall = _createRequireCall(resourcePath);
         const propAssign = ts.createPropertyAssignment('template', requireCall);
-        ops.push(new ReplaceNodeOperation(sourceFile, node, propAssign));
+        replacements.push({
+          resourcePaths: [resourcePath],
+          replaceNodeOperation: new ReplaceNodeOperation(sourceFile, node, propAssign)
+        });
       } else if (key == 'styleUrls') {
-        const arr = findAstNodes<ts.ArrayLiteralExpression>(node, sourceFile,
-          ts.SyntaxKind.ArrayLiteralExpression, false);
+        const arr = collectDeepNodes<ts.ArrayLiteralExpression>(node,
+          ts.SyntaxKind.ArrayLiteralExpression);
         if (!arr || arr.length == 0 || arr[0].elements.length == 0) {
           return;
         }
@@ -52,34 +107,15 @@ export function replaceResources(sourceFile: ts.SourceFile): TransformOperation[
         );
 
         const propAssign = ts.createPropertyAssignment('styles', requireArray);
-        ops.push(new ReplaceNodeOperation(sourceFile, node, propAssign));
+        replacements.push({
+          resourcePaths: stylePaths,
+          replaceNodeOperation: new ReplaceNodeOperation(sourceFile, node, propAssign)
+        });
       }
     });
 
-  if (ops.length > 0) {
-    // If we added a require call, we need to also add typings for it.
-    // The typings need to be compatible with node typings, but also work by themselves.
+  return replacements;
 
-    // interface NodeRequire {(id: string): any;}
-    const nodeRequireInterface = ts.createInterfaceDeclaration([], [], 'NodeRequire', [], [], [
-      ts.createCallSignature([], [
-        ts.createParameter([], [], undefined, 'id', undefined,
-          ts.createKeywordTypeNode(ts.SyntaxKind.StringKeyword)
-        )
-      ], ts.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword))
-    ]);
-
-    // declare var require: NodeRequire;
-    const varRequire = ts.createVariableStatement(
-      [ts.createToken(ts.SyntaxKind.DeclareKeyword)],
-      [ts.createVariableDeclaration('require', ts.createTypeReferenceNode('NodeRequire', []))]
-    );
-
-    ops.push(new AddNodeOperation(sourceFile, getFirstNode(sourceFile), nodeRequireInterface));
-    ops.push(new AddNodeOperation(sourceFile, getFirstNode(sourceFile), varRequire));
-  }
-
-  return ops;
 }
 
 function _getContentOfKeyLiteral(node?: ts.Node): string | null {

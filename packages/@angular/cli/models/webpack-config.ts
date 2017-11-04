@@ -1,3 +1,8 @@
+// @ignoreDep typescript - used only for type information
+import * as ts from 'typescript';
+import { AngularCompilerPlugin } from '@ngtools/webpack';
+import { readTsconfig } from '../utilities/read-tsconfig';
+import { requireProjectModule } from '../utilities/require-project-module';
 const webpackMerge = require('webpack-merge');
 import { CliConfig } from './config';
 import { BuildOptions } from './build-options';
@@ -12,12 +17,13 @@ import {
   getAotConfig
 } from './webpack-configs';
 import * as path from 'path';
-import { AngularCompilerPlugin } from '@ngtools/webpack';
 
 export interface WebpackConfigOptions<T extends BuildOptions = BuildOptions> {
   projectRoot: string;
   buildOptions: T;
   appConfig: any;
+  tsConfig: any;
+  supportES2015: boolean;
 }
 
 export class NgCliWebpackConfig<T extends BuildOptions = BuildOptions> {
@@ -34,7 +40,15 @@ export class NgCliWebpackConfig<T extends BuildOptions = BuildOptions> {
     buildOptions = this.addTargetDefaults(buildOptions);
     buildOptions = this.mergeConfigs(buildOptions, appConfig, projectRoot);
 
-    this.wco = { projectRoot, buildOptions, appConfig };
+    const tsconfigPath = path.resolve(projectRoot, appConfig.root, appConfig.tsconfig);
+    const tsConfig = readTsconfig(tsconfigPath);
+
+    const projectTs = requireProjectModule(projectRoot, 'typescript') as typeof ts;
+
+    const supportES2015 = tsConfig.options.target !== projectTs.ScriptTarget.ES3
+                        && tsConfig.options.target !== projectTs.ScriptTarget.ES5;
+
+    this.wco = { projectRoot, buildOptions, appConfig, tsConfig, supportES2015 };
   }
 
   public buildConfig() {
@@ -79,10 +93,6 @@ export class NgCliWebpackConfig<T extends BuildOptions = BuildOptions> {
       && !(buildOptions.aot || buildOptions.target === 'production')) {
       throw new Error('The `--build-optimizer` option cannot be used without `--aot`.');
     }
-
-    if (buildOptions.experimentalAngularCompiler && !AngularCompilerPlugin.isSupported()) {
-      throw new Error('You need Angular 5 and up to use --experimental-angular-compiler.');
-    }
   }
 
   // Fill in defaults for build targets
@@ -94,7 +104,8 @@ export class NgCliWebpackConfig<T extends BuildOptions = BuildOptions> {
         sourcemaps: true,
         extractCss: false,
         namedChunks: true,
-        aot: false
+        aot: false,
+        buildOptimizer: false
       },
       production: {
         environment: 'prod',
@@ -106,7 +117,23 @@ export class NgCliWebpackConfig<T extends BuildOptions = BuildOptions> {
       }
     };
 
-    return Object.assign({}, targetDefaults[buildOptions.target], buildOptions);
+    let merged = Object.assign({}, targetDefaults[buildOptions.target], buildOptions);
+
+    // Use Build Optimizer on prod AOT builds by default when AngularCompilerPlugin is supported.
+    const buildOptimizerDefault = {
+      buildOptimizer: buildOptions.target == 'production' && AngularCompilerPlugin.isSupported()
+    };
+
+    merged = Object.assign({}, buildOptimizerDefault, merged);
+
+    // Default vendor chunk to false when build optimizer is on.
+    const vendorChunkDefault = {
+      vendorChunk: !merged.buildOptimizer
+    };
+
+    merged = Object.assign({}, vendorChunkDefault, merged);
+
+    return merged;
   }
 
   // Fill in defaults from .angular-cli.json

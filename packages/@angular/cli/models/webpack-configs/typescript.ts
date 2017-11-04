@@ -18,11 +18,18 @@ const webpackLoader: string = g['angularCliIsLocal']
   : '@ngtools/webpack';
 
 
-function _createAotPlugin(wco: WebpackConfigOptions, options: any) {
+function _createAotPlugin(wco: WebpackConfigOptions, options: any, useMain = true) {
   const { appConfig, projectRoot, buildOptions } = wco;
   options.compilerOptions = options.compilerOptions || {};
+
   if (wco.buildOptions.preserveSymlinks) {
     options.compilerOptions.preserveSymlinks = true;
+  }
+
+  // Forcing commonjs seems to drastically improve rebuild speeds on webpack.
+  // Dev builds on watch mode will set this option to true.
+  if (wco.buildOptions.forceTsCommonjs) {
+    options.compilerOptions.module = 'commonjs';
   }
 
   // Read the environment, and set it in the compiler host.
@@ -73,9 +80,9 @@ function _createAotPlugin(wco: WebpackConfigOptions, options: any) {
     };
   }
 
-if (wco.buildOptions.experimentalAngularCompiler) {
+  if (AngularCompilerPlugin.isSupported()) {
     const pluginOptions: AngularCompilerPluginOptions = Object.assign({}, {
-      mainPath: path.join(projectRoot, appConfig.root, appConfig.main),
+      mainPath: useMain ? path.join(projectRoot, appConfig.root, appConfig.main) : undefined,
       i18nInFile: buildOptions.i18nFile,
       i18nInFormat: buildOptions.i18nFormat,
       i18nOutFile: buildOptions.i18nOutFile,
@@ -85,8 +92,6 @@ if (wco.buildOptions.experimentalAngularCompiler) {
       missingTranslation: buildOptions.missingTranslation,
       hostReplacementPaths,
       sourceMap: buildOptions.sourcemaps,
-      // If we don't explicitely list excludes, it will default to `['**/*.spec.ts']`.
-      exclude: []
     }, options);
     return new AngularCompilerPlugin(pluginOptions);
   } else {
@@ -126,7 +131,9 @@ export function getAotConfig(wco: WebpackConfigOptions) {
   // Fallback to exclude spec files from AoT compilation on projects using a shared tsconfig.
   if (testTsConfigPath === tsConfigPath) {
     let exclude = [ '**/*.spec.ts' ];
-    if (appConfig.test) { exclude.push(path.join(projectRoot, appConfig.root, appConfig.test)); }
+    if (appConfig.test) {
+      exclude.push(path.join(projectRoot, appConfig.root, appConfig.test));
+    }
     pluginOptions.exclude = exclude;
   }
 
@@ -138,8 +145,12 @@ export function getAotConfig(wco: WebpackConfigOptions) {
     }];
   }
 
+  const test = AngularCompilerPlugin.isSupported()
+    ? /(?:\.ngfactory\.js|\.ngstyle\.js|\.ts)$/
+    : /\.ts$/;
+
   return {
-    module: { rules: [{ test: /\.ts$/, use: [...boLoader, webpackLoader] }] },
+    module: { rules: [{ test, use: [...boLoader, webpackLoader] }] },
     plugins: [ _createAotPlugin(wco, pluginOptions) ]
   };
 }
@@ -151,13 +162,33 @@ export function getNonAotTestConfig(wco: WebpackConfigOptions) {
 
   let pluginOptions: any = { tsConfigPath, skipCodeGeneration: true };
 
-  // Fallback to correct module format on projects using a shared tsconfig.
-  if (tsConfigPath === appTsConfigPath) {
-    pluginOptions.compilerOptions = { module: 'commonjs' };
+  if (AngularCompilerPlugin.isSupported()) {
+    if (appConfig.polyfills) {
+      // TODO: remove singleFileIncludes for 2.0, this is just to support old projects that did not
+      // include 'polyfills.ts' in `tsconfig.spec.json'.
+      const polyfillsPath = path.resolve(projectRoot, appConfig.root, appConfig.polyfills);
+      pluginOptions.singleFileIncludes = [polyfillsPath];
+    }
+  } else {
+    // The options below only apply to AoTPlugin.
+    // Force include main and polyfills.
+    // This is needed for AngularCompilerPlugin compatibility with existing projects,
+    // since TS compilation there is stricter and tsconfig.spec.ts doesn't include them.
+    const include = [appConfig.main, appConfig.polyfills, '**/*.spec.ts'];
+    if (appConfig.test) {
+      include.push(appConfig.test);
+    }
+
+    pluginOptions.include = include;
+
+    // Fallback to correct module format on projects using a shared tsconfig.
+    if (tsConfigPath === appTsConfigPath) {
+      pluginOptions.compilerOptions = { module: 'commonjs' };
+    }
   }
 
   return {
     module: { rules: [{ test: /\.ts$/, loader: webpackLoader }] },
-    plugins: [ _createAotPlugin(wco, pluginOptions) ]
+    plugins: [ _createAotPlugin(wco, pluginOptions, false) ]
   };
 }

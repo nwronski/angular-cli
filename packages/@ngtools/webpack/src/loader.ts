@@ -14,6 +14,8 @@ interface Platform {
 const loaderUtils = require('loader-utils');
 const NormalModule = require('webpack/lib/NormalModule');
 
+const sourceMappingUrlRe = /^\/\/# sourceMappingURL=[^\r\n]*/gm;
+
 // This is a map of changes which need to be made
 const changeMap: {[key: string]: Platform} = {
   platformBrowserDynamic: {
@@ -429,6 +431,28 @@ function _getResourcesUrls(refactor: TypeScriptFileRefactor): string[] {
 }
 
 
+function _getImports(refactor: TypeScriptFileRefactor,
+                     compilerOptions: ts.CompilerOptions,
+                     host: ts.ModuleResolutionHost,
+                     cache: ts.ModuleResolutionCache): string[] {
+  const containingFile = refactor.fileName;
+
+  return refactor.findAstNodes(null, ts.SyntaxKind.ImportDeclaration, false)
+    .map((clause: ts.ImportDeclaration) => {
+      const moduleName = (clause.moduleSpecifier as ts.StringLiteral).text;
+      const resolved = ts.resolveModuleName(
+        moduleName, containingFile, compilerOptions, host, cache);
+
+      if (resolved.resolvedModule) {
+        return resolved.resolvedModule.resolvedFileName;
+      } else {
+        return null;
+      }
+    })
+    .filter(x => x);
+}
+
+
 /**
  * Recursively calls diagnose on the plugins for all the reverse dependencies.
  * @private
@@ -543,20 +567,59 @@ export function ngcLoader(this: LoaderContext & { _compilation: any }, source: s
       plugin.done
         .then(() => {
           timeEnd(timeLabel + '.ngcLoader.AngularCompilerPlugin');
-          const result = plugin.getFile(sourceFileName);
-          if (plugin.failedCompilation) {
-            // Return an empty string if there is no result to prevent extra loader errors.
-            // Plugin errors were already pushed to the compilation errors.
-            timeEnd(timeLabel);
-            cb(null, result.outputText || '', result.sourceMap);
-          } else {
-            timeEnd(timeLabel);
+          const result = plugin.getCompiledFile(sourceFileName);
+
+          if (result.sourceMap) {
+            // Process sourcemaps for Webpack.
+            // Remove the sourceMappingURL.
+            result.outputText = result.outputText.replace(sourceMappingUrlRe, '');
+            // Set the map source to use the full path of the file.
+            const sourceMap = JSON.parse(result.sourceMap);
+            sourceMap.sources = sourceMap.sources.map((fileName: string) => {
+              return path.join(path.dirname(sourceFileName), fileName);
+            });
+            result.sourceMap = sourceMap;
+          }
+
+          // Manually add the dependencies for TS files.
+          // Type only imports will be stripped out by compilation so we need to add them as
+          // as dependencies.
+          // Component resources files (html and css templates) also need to be added manually for
+          // AOT, so that this file is reloaded when they change.
+          if (sourceFileName.endsWith('.ts')) {
+            result.errorDependencies.forEach(dep => this.addDependency(dep));
+            const dependencies = plugin.getDependencies(sourceFileName);
+            dependencies.forEach(dep => this.addDependency(dep));
+          }
+
+          // NgFactory files depend on the component template, but we can't know what that file
+          // is (if any). So we add all the dependencies that the original component file has
+          // to the factory as well, which includes html and css templates, and the component
+          // itself (for inline html/templates templates).
+          const ngFactoryRe = /\.ngfactory.js$/;
+          if (ngFactoryRe.test(sourceFileName)) {
+            const originalFile = sourceFileName.replace(ngFactoryRe, '.ts');
+            this.addDependency(originalFile);
+            const origDependencies = plugin.getDependencies(originalFile);
+            origDependencies.forEach(dep => this.addDependency(dep));
+          }
+
+          // NgStyle files depend on the style file they represent.
+          // E.g. `some-style.less.shim.ngstyle.js` depends on `some-style.less`.
+          // Those files can in turn depend on others, so we have to add them all.
+          const ngStyleRe = /(?:\.shim)?\.ngstyle\.js$/;
+          if (ngStyleRe.test(sourceFileName)) {
+            const styleFile = sourceFileName.replace(ngStyleRe, '');
+            const styleDependencies = plugin.getResourceDependencies(styleFile);
+            styleDependencies.forEach(dep => this.addDependency(dep));
+          }
+
+          timeEnd(timeLabel);
           cb(null, result.outputText, result.sourceMap);
-        }
-      })
-      .catch(err => {
-        timeEnd(timeLabel + '.ngcLoader.AngularCompilerPlugin');
-        cb(err);
+        })
+        .catch(err => {
+          timeEnd(timeLabel);
+          cb(err);
         });
     } else if (plugin instanceof AotPlugin) {
       time(timeLabel + '.ngcLoader.AotPlugin');
@@ -568,6 +631,12 @@ export function ngcLoader(this: LoaderContext & { _compilation: any }, source: s
       const refactor = new TypeScriptFileRefactor(
         sourceFileName, plugin.compilerHost, plugin.program, source);
 
+      // Force a few compiler options to make sure we get the result we want.
+      const compilerOptions: ts.CompilerOptions = Object.assign({}, plugin.compilerOptions, {
+        inlineSources: true,
+        inlineSourceMap: false,
+        sourceRoot: plugin.basePath
+      });
 
       Promise.resolve()
         .then(() => {
@@ -606,6 +675,9 @@ export function ngcLoader(this: LoaderContext & { _compilation: any }, source: s
           _getResourcesUrls(refactor).forEach((url: string) => {
             this.addDependency(path.resolve(path.dirname(sourceFileName), url));
           });
+          // Dependencies must use system path separator.
+          _getImports(refactor, compilerOptions, plugin.compilerHost, plugin.moduleResolutionCache)
+            .forEach((dep) => this.addDependency(dep.replace(/\//g, path.sep)));
           timeEnd(timeLabel + '.ngcLoader.AotPlugin.addDependency');
         })
         .then(() => {
@@ -633,27 +705,17 @@ export function ngcLoader(this: LoaderContext & { _compilation: any }, source: s
             timeEnd(timeLabel + '.ngcLoader.AotPlugin.getDiagnostics');
           }
 
-          // Force a few compiler options to make sure we get the result we want.
-          const compilerOptions: ts.CompilerOptions = Object.assign({}, plugin.compilerOptions, {
-            inlineSources: true,
-            inlineSourceMap: false,
-            sourceRoot: plugin.basePath
-          });
-
           time(timeLabel + '.ngcLoader.AotPlugin.transpile');
           const result = refactor.transpile(compilerOptions);
           timeEnd(timeLabel + '.ngcLoader.AotPlugin.transpile');
 
           timeEnd(timeLabel + '.ngcLoader.AotPlugin');
-          if (plugin.failedCompilation && plugin.compilerOptions.noEmitOnError) {
-            // Return an empty string to prevent extra loader errors (missing imports etc).
-            // Plugin errors were already pushed to the compilation errors.
-            timeEnd(timeLabel);
-            cb(null, '');
-          } else {
-            timeEnd(timeLabel);
-            cb(null, result.outputText, result.sourceMap);
+          timeEnd(timeLabel);
+
+          if (result.outputText === undefined) {
+            throw new Error('TypeScript compilation failed.');
           }
+          cb(null, result.outputText, result.sourceMap);
         })
         .catch(err => cb(err));
       }
@@ -686,7 +748,7 @@ export function ngcLoader(this: LoaderContext & { _compilation: any }, source: s
 
     const result = refactor.transpile(compilerOptions);
     // Webpack is going to take care of this.
-    result.outputText = result.outputText.replace(/^\/\/# sourceMappingURL=[^\r\n]*/gm, '');
+    result.outputText = result.outputText.replace(sourceMappingUrlRe, '');
     timeEnd(timeLabel);
     cb(null, result.outputText, result.sourceMap);
   }

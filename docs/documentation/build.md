@@ -81,6 +81,7 @@ Flag                | `--dev` | `--prod`
 `--sourcemaps`      | `true`  | `false`
 `--extract-css`     | `false` | `true`
 `--named-chunks`    | `true`  | `false`
+`--build-optimizer` | `false` | `true` with AOT and Angular 5
 
 `--extract-licenses` Extract all licenses in a separate file, in the case of production builds only.
 `--i18n-file` Localization file to use for i18n.
@@ -353,7 +354,7 @@ Note: service worker support is experimental and subject to change.
     <code>--build-optimizer</code>
   </p>
   <p>
-    (Experimental) Enables @angular-devkit/build-optimizer optimizations when using `--aot`.
+    Enables @angular-devkit/build-optimizer optimizations when using `--aot`.
   </p>
 </details>
 
@@ -364,5 +365,15 @@ Note: service worker support is experimental and subject to change.
   </p>
   <p>
     Use file name for lazy loaded chunks.
+  </p>
+</details>
+
+<details>
+  <summary>bundle-dependencies</summary>
+  <p>
+    <code>--bundle-dependencies</code>
+  </p>
+  <p>
+    In a server build, state whether `all` or `none` dependencies should be bundles in the output.
   </p>
 </details>

@@ -1,5 +1,6 @@
+// @ignoreDep typescript
 import * as ts from 'typescript';
-import {basename, dirname, join} from 'path';
+import {basename, dirname, join, sep} from 'path';
 import * as fs from 'fs';
 import {WebpackResourceLoader} from './resource_loader';
 
@@ -96,6 +97,7 @@ export class WebpackCompilerHost implements ts.CompilerHost {
   private _delegate: ts.CompilerHost;
   private _files: {[path: string]: VirtualFileStats | null} = Object.create(null);
   private _directories: {[path: string]: VirtualDirStats | null} = Object.create(null);
+  private _cachedResources: {[path: string]: string | undefined} = Object.create(null);
 
   private _changedFiles: {[path: string]: boolean} = Object.create(null);
   private _changedDirs: {[path: string]: boolean} = Object.create(null);
@@ -114,6 +116,10 @@ export class WebpackCompilerHost implements ts.CompilerHost {
 
   private _normalizePath(path: string) {
     return path.replace(/\\/g, '/');
+  }
+
+  denormalizePath(path: string) {
+    return path.replace(/\//g, sep);
   }
 
   resolve(path: string) {
@@ -155,6 +161,13 @@ export class WebpackCompilerHost implements ts.CompilerHost {
 
   getChangedFilePaths(): string[] {
     return Object.keys(this._changedFiles);
+  }
+
+  getNgFactoryPaths(): string[] {
+    return Object.keys(this._files)
+      .filter(fileName => fileName.endsWith('.ngfactory.js') || fileName.endsWith('.ngstyle.js'))
+      // These paths are used by the virtual file system decorator so we must denormalize them.
+      .map((path) => this.denormalizePath(path));
   }
 
   invalidate(fileName: string): void {
@@ -284,9 +297,24 @@ export class WebpackCompilerHost implements ts.CompilerHost {
 
   readResource(fileName: string) {
     if (this._resourceLoader) {
-      // We still read it to add it to the compiler host file list.
-      this.readFile(fileName);
-      return this._resourceLoader.get(fileName);
+      // These paths are meant to be used by the loader so we must denormalize them.
+      const denormalizedFileName = this.denormalizePath(fileName);
+      const resourceDeps = this._resourceLoader.getResourceDependencies(denormalizedFileName);
+
+      if (this._cachedResources[fileName] === undefined
+        || resourceDeps.some((dep) => this._changedFiles[this.resolve(dep)])) {
+        return this._resourceLoader.get(denormalizedFileName)
+          .then((resource) => {
+            // Add resource dependencies to the compiler host file list.
+            // This way we can check the changed files list to determine whether to use cache.
+            this._resourceLoader.getResourceDependencies(denormalizedFileName)
+              .forEach((dep) => this.readFile(dep));
+            this._cachedResources[fileName] = resource;
+            return resource;
+          });
+      } else {
+        return this._cachedResources[fileName];
+      }
     } else {
       return this.readFile(fileName);
     }

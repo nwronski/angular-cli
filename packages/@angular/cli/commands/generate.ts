@@ -1,4 +1,4 @@
-import { cyan, yellow } from 'chalk';
+import chalk from 'chalk';
 const stringUtils = require('ember-cli-string-utils');
 import { oneLine } from 'common-tags';
 import { CliConfig } from '../models/config';
@@ -17,6 +17,7 @@ import { SchematicAvailableOptions } from '../tasks/schematic-get-options';
 const Command = require('../ember-cli/lib/models/command');
 const SilentError = require('silent-error');
 
+const { cyan, yellow } = chalk;
 const separatorRegEx = /[\/\\]/g;
 
 
@@ -137,15 +138,18 @@ export default Command.extend({
       dryRun: commandOptions.dryRun
     };
     const parsedPath = dynamicPathParser(dynamicPathOptions);
-    const root = appConfig.root + path.sep;
     commandOptions.sourceDir = appConfig.root;
-    commandOptions.appRoot = parsedPath.appRoot.startsWith(root)
-      ? parsedPath.appRoot.substr(root.length)
-      : parsedPath.appRoot;
+    const root = appConfig.root + path.sep;
+    commandOptions.appRoot = parsedPath.appRoot === appConfig.root ? '' :
+      parsedPath.appRoot.startsWith(root)
+        ? parsedPath.appRoot.substr(root.length)
+        : parsedPath.appRoot;
+
     commandOptions.path = parsedPath.dir.replace(separatorRegEx, '/');
-    if (parsedPath.dir.startsWith(root)) {
-      commandOptions.path = commandOptions.path.substr(root.length);
-    }
+    commandOptions.path = parsedPath.dir === appConfig.root ? '' :
+      parsedPath.dir.startsWith(root)
+        ? commandOptions.path.substr(root.length)
+        : commandOptions.path;
 
     const cwd = this.project.root;
     const schematicName = rawArgs[0];
@@ -167,7 +171,8 @@ export default Command.extend({
       ui: this.ui,
       project: this.project
     });
-    const collectionName = this.getCollectionName(rawArgs);
+    const collectionName = commandOptions.collection ||
+      CliConfig.getValue('defaults.schematics.collection');
 
     if (collectionName === '@schematics/angular' && schematicName === 'interface' && rawArgs[2]) {
       commandOptions.type = rawArgs[2];
@@ -181,15 +186,36 @@ export default Command.extend({
       });
   },
 
-  printDetailedHelp: function () {
+  printDetailedHelp: function (_options: any, rawArgs: any): string | Promise<string> {
     const engineHost = getEngineHost();
     const collectionName = this.getCollectionName();
     const collection = getCollection(collectionName);
-    const schematicNames: string[] = engineHost.listSchematics(collection);
-    this.ui.writeLine(cyan('Available schematics:'));
-    schematicNames.forEach(schematicName => {
-      this.ui.writeLine(yellow(`    ${schematicName}`));
-    });
-    this.ui.writeLine('');
+    const schematicName = rawArgs[1];
+    if (schematicName) {
+      const SchematicGetHelpOutputTask = require('../tasks/schematic-get-help-output').default;
+      const getHelpOutputTask = new SchematicGetHelpOutputTask({
+        ui: this.ui,
+        project: this.project
+      });
+      return getHelpOutputTask.run({
+        schematicName,
+        collectionName,
+        nonSchematicOptions: this.availableOptions.filter((o: any) => !o.hidden)
+      })
+      .then((output: string[]) => {
+        return [
+          cyan(`ng generate ${schematicName} ${cyan('[name]')} ${cyan('<options...>')}`),
+          ...output
+        ].join('\n');
+      });
+    } else {
+      const schematicNames: string[] = engineHost.listSchematics(collection);
+      const output: string[] = [];
+      output.push(cyan('Available schematics:'));
+      schematicNames.forEach(schematicName => {
+        output.push(yellow(`    ${schematicName}`));
+      });
+      return Promise.resolve(output.join('\n'));
+    }
   }
 });
