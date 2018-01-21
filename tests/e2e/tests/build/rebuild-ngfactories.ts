@@ -18,6 +18,11 @@ export default function () {
     return Promise.resolve();
   }
 
+  // Skip this test in Angular 2/4.
+  if (getGlobalVariable('argv').ng2 || getGlobalVariable('argv').ng4) {
+    return Promise.resolve();
+  }
+
   return execAndWaitForOutputToMatch('ng', ['serve', '--aot'], validBundleRegEx)
     .then(() => writeMultipleFiles({
       'src/app/app.component.css': `
@@ -70,8 +75,8 @@ export default function () {
       }
     })
     .then(() => {
-      // Skip in non-nightly tests. Switch this check around when ng5 is out.
-      if (!getGlobalVariable('argv').nightly) {
+      // Skip this part of the test in Angular 2/4.
+      if (getGlobalVariable('argv').ng2 || getGlobalVariable('argv').ng4) {
         return Promise.resolve();
       }
 

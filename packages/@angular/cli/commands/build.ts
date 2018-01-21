@@ -2,9 +2,12 @@ import { CliConfig } from '../models/config';
 import { BuildOptions } from '../models/build-options';
 import { Version } from '../upgrade/version';
 import { oneLine } from 'common-tags';
+import { getAppFromConfig } from '../utilities/app-utils';
+import { join } from 'path';
+import { RenderUniversalTaskOptions } from '../tasks/render-universal';
 
 const Command = require('../ember-cli/lib/models/command');
-
+const SilentError = require('silent-error');
 
 const config = CliConfig.fromProject() || CliConfig.fromGlobal();
 const buildConfigDefaults = config.getPaths('defaults.build', [
@@ -83,7 +86,9 @@ export const baseBuildCommandOptions: any = [
     type: Boolean,
     aliases: ['pr'],
     description: 'Log progress to the console while building.',
-    default: buildConfigDefaults['progress']
+    default: typeof buildConfigDefaults['progress'] !== 'undefined'
+      ? buildConfigDefaults['progress']
+      : process.stdout.isTTY === true
   },
   {
     name: 'i18n-file',
@@ -188,6 +193,20 @@ export const baseBuildCommandOptions: any = [
     default: 'none',
     description: 'Available on server platform only. Which external dependencies to bundle into '
                + 'the module. By default, all of node_modules will be kept as requires.'
+  },
+  {
+    name: 'service-worker',
+    type: Boolean,
+    default: true,
+    aliases: ['sw'],
+    description: 'Generates a service worker config for production builds, if the app has '
+               + 'service worker enabled.'
+  },
+  {
+    name: 'skip-app-shell',
+    type: Boolean,
+    description: 'Flag to prevent building an app shell',
+    default: false
   }
 ];
 
@@ -220,6 +239,11 @@ const BuildCommand = Command.extend({
       commandOptions.forceTsCommonjs = true;
     }
 
+    // Add trailing slash if missing to prevent https://github.com/angular/angular-cli/issues/7295
+    if (commandOptions.deployUrl && commandOptions.deployUrl.substr(-1) !== '/') {
+      commandOptions.deployUrl += '/';
+    }
+
     const BuildTask = require('../tasks/build').default;
 
     const buildTask = new BuildTask({
@@ -227,7 +251,51 @@ const BuildCommand = Command.extend({
       ui: this.ui,
     });
 
-    return buildTask.run(commandOptions);
+    const clientApp = getAppFromConfig(commandOptions.app);
+
+    const doAppShell = commandOptions.target === 'production' &&
+      (commandOptions.aot === undefined || commandOptions.aot === true) &&
+      !commandOptions.skipAppShell;
+
+    let serverApp: any = null;
+    if (clientApp.appShell && doAppShell) {
+      serverApp = getAppFromConfig(clientApp.appShell.app);
+      if (serverApp.platform !== 'server') {
+        throw new SilentError(`Shell app's platform is not "server"`);
+      }
+    }
+
+    const buildPromise = buildTask.run(commandOptions);
+
+    if (!clientApp.appShell || !doAppShell) {
+      return buildPromise;
+    }
+
+    return buildPromise
+      .then(() => {
+
+        const serverOptions = {
+          ...commandOptions,
+          app: clientApp.appShell.app
+        };
+        return buildTask.run(serverOptions);
+      })
+      .then(() => {
+        const RenderUniversalTask = require('../tasks/render-universal').default;
+
+        const renderUniversalTask = new RenderUniversalTask({
+          project: this.project,
+          ui: this.ui,
+        });
+        const renderUniversalOptions: RenderUniversalTaskOptions = {
+          inputIndexPath: join(this.project.root, clientApp.outDir, clientApp.index),
+          route: clientApp.appShell.route,
+          serverOutDir: join(this.project.root, serverApp.outDir),
+          outputIndexPath: join(this.project.root, clientApp.outDir, clientApp.index)
+        };
+
+        return renderUniversalTask.run(renderUniversalOptions);
+      });
   }
 });
 

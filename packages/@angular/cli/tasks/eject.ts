@@ -7,6 +7,7 @@ import { getAppFromConfig } from '../utilities/app-utils';
 import { EjectTaskOptions } from '../commands/eject';
 import { NgCliWebpackConfig } from '../models/webpack-config';
 import { CliConfig } from '../models/config';
+import { usesServiceWorker } from '../utilities/service-worker';
 import { stripBom } from '../utilities/strip-bom';
 import { AotPlugin, AngularCompilerPlugin } from '@ngtools/webpack';
 import { PurifyPlugin } from '@angular-devkit/build-optimizer';
@@ -25,7 +26,6 @@ const HtmlWebpackPlugin = require('html-webpack-plugin');
 const SubresourceIntegrityPlugin = require('webpack-subresource-integrity');
 const SilentError = require('silent-error');
 const CircularDependencyPlugin = require('circular-dependency-plugin');
-const ConcatPlugin = require('webpack-concat-plugin');
 const UglifyJSPlugin = require('uglifyjs-webpack-plugin');
 const Task = require('../ember-cli/lib/models/task');
 
@@ -87,6 +87,13 @@ class JsonWebpackSerializer {
     return {
       patterns,
       globOptions: this._globReplacer(globOptions)
+    };
+  }
+
+  private _bundleBudgetPluginSerialize(value: any): any {
+    let budgets = value.options.budgets;
+    return {
+      budgets
     };
   }
 
@@ -155,19 +162,7 @@ class JsonWebpackSerializer {
   }
 
   private _licenseWebpackPlugin(plugin: any) {
-    return plugin.options;
-  }
-
-  private _concatPlugin(plugin: any) {
-    const options = plugin.settings;
-    if (!options || !options.filesToConcat) {
-      return options;
-    }
-
-    const filesToConcat = options.filesToConcat
-      .map((file: string) => path.relative(process.cwd(), file));
-
-    return { ...options, filesToConcat };
+    return this._licenseReplacer(plugin.options);
   }
 
   private _uglifyjsPlugin(plugin: any) {
@@ -202,13 +197,19 @@ class JsonWebpackSerializer {
           this._addImport('webpack.optimize', 'ModuleConcatenationPlugin');
           break;
         case angularCliPlugins.BaseHrefWebpackPlugin:
+        case angularCliPlugins.CleanCssWebpackPlugin:
         case angularCliPlugins.NamedLazyChunksWebpackPlugin:
+        case angularCliPlugins.ScriptsWebpackPlugin:
         case angularCliPlugins.SuppressExtractedTextChunksWebpackPlugin:
           this._addImport('@angular/cli/plugins/webpack', plugin.constructor.name);
           break;
         case angularCliPlugins.GlobCopyWebpackPlugin:
           args = this._globCopyWebpackPluginSerialize(plugin);
           this._addImport('@angular/cli/plugins/webpack', 'GlobCopyWebpackPlugin');
+          break;
+        case angularCliPlugins.BundleBudgetPlugin:
+          args = this._bundleBudgetPluginSerialize(plugin);
+          this._addImport('@angular/cli/plugins/webpack', 'BundleBudgetPlugin');
           break;
         case angularCliPlugins.InsertConcatAssetsWebpackPlugin:
           args = this._insertConcatAssetsWebpackPluginSerialize(plugin);
@@ -248,10 +249,6 @@ class JsonWebpackSerializer {
           args = this._licenseWebpackPlugin(plugin);
           this._addImport('license-webpack-plugin', 'LicenseWebpackPlugin');
           break;
-        case ConcatPlugin:
-          args = this._concatPlugin(plugin);
-          this.variableImports['webpack-concat-plugin'] = 'ConcatPlugin';
-          break;
         case UglifyJSPlugin:
           args = this._uglifyjsPlugin(plugin);
           this.variableImports['uglifyjs-webpack-plugin'] = 'UglifyJsPlugin';
@@ -286,8 +283,10 @@ class JsonWebpackSerializer {
   }
 
   private _resolveReplacer(value: any) {
+    this.variableImports['rxjs/_esm5/path-mapping'] = 'rxPaths';
     return Object.assign({}, value, {
-      modules: value.modules.map((x: string) => './' + path.relative(this._root, x))
+      modules: value.modules.map((x: string) => './' + path.relative(this._root, x)),
+      alias: this._escape('rxPaths()')
     });
   }
 
@@ -407,6 +406,13 @@ class JsonWebpackSerializer {
     });
   }
 
+  private _licenseReplacer(value: any) {
+    return Object.assign({}, value, {
+      outputTemplate: this._relativePath(
+        'process.cwd()', path.relative(this._root, value.outputTemplate))
+    });
+  }
+
   private _replacer(_key: string, value: any) {
     if (value === undefined) {
       return value;
@@ -482,7 +488,6 @@ class JsonWebpackSerializer {
   }
 }
 
-
 export default Task.extend({
   run: function (runTaskOptions: EjectTaskOptions) {
     const project = this.project;
@@ -519,31 +524,35 @@ export default Task.extend({
       .then((packageJson: string) => JSON.parse(packageJson))
       .then((packageJson: any) => {
         const scripts = packageJson['scripts'];
-        if (scripts['build'] && scripts['build'] !== 'ng build' && !force) {
-          throw new SilentError(oneLine`
-            Your package.json scripts must not contain a build script as it will be overwritten.
-          `);
-        }
-        if (scripts['start'] && scripts['start'] !== 'ng serve' && !force) {
-          throw new SilentError(oneLine`
-            Your package.json scripts must not contain a start script as it will be overwritten.
-          `);
-        }
-        if (scripts['pree2e'] && scripts['pree2e'] !== pree2eNpmScript && !force) {
-          throw new SilentError(oneLine`
-            Your package.json scripts must not contain a pree2e script as it will be
-            overwritten.
-          `);
-        }
-        if (scripts['e2e'] && scripts['e2e'] !== 'ng e2e' && !force) {
-          throw new SilentError(oneLine`
-            Your package.json scripts must not contain a e2e script as it will be overwritten.
-          `);
-        }
-        if (scripts['test'] && scripts['test'] !== 'ng test' && !force) {
-          throw new SilentError(oneLine`
-            Your package.json scripts must not contain a test script as it will be overwritten.
-          `);
+        if (!force) {
+          if (scripts['build']
+              && scripts['build'] != 'ng build'
+              && scripts['build'] != 'ng build --prod') {
+            throw new SilentError(oneLine`
+              Your package.json scripts must not contain a build script as it will be overwritten.
+            `);
+          }
+          if (scripts['start'] && scripts['start'] !== 'ng serve') {
+            throw new SilentError(oneLine`
+              Your package.json scripts must not contain a start script as it will be overwritten.
+            `);
+          }
+          if (scripts['pree2e'] && scripts['pree2e'] !== pree2eNpmScript) {
+            throw new SilentError(oneLine`
+              Your package.json scripts must not contain a pree2e script as it will be
+              overwritten.
+            `);
+          }
+          if (scripts['e2e'] && scripts['e2e'] !== 'ng e2e') {
+            throw new SilentError(oneLine`
+              Your package.json scripts must not contain a e2e script as it will be overwritten.
+            `);
+          }
+          if (scripts['test'] && scripts['test'] !== 'ng test') {
+            throw new SilentError(oneLine`
+              Your package.json scripts must not contain a test script as it will be overwritten.
+            `);
+          }
         }
 
         packageJson['scripts']['build'] = 'webpack';
@@ -551,6 +560,16 @@ export default Task.extend({
         packageJson['scripts']['test'] = 'karma start ./karma.conf.js';
         packageJson['scripts']['pree2e'] = pree2eNpmScript;
         packageJson['scripts']['e2e'] = 'protractor ./protractor.conf.js';
+
+        if (!!appConfig.serviceWorker && runTaskOptions.target === 'production' &&
+            usesServiceWorker(project.root) && !!runTaskOptions.serviceWorker) {
+          packageJson['scripts']['build'] += ' && npm run sw-config && npm run sw-copy';
+          packageJson['scripts']['sw-config'] = `ngsw-config ${outputPath} src/ngsw-config.json`;
+          packageJson['scripts']['sw-copy'] =
+              `cpx node_modules/@angular/service-worker/ngsw-worker.js ${outputPath}`;
+
+          packageJson['devDependencies']['cpx'] = '^1.5.0';
+        }
 
         // Add new dependencies based on our dependencies.
         const ourPackageJson = require('../package.json');
@@ -565,13 +584,13 @@ export default Task.extend({
           'webpack',
           'autoprefixer',
           'css-loader',
-          'cssnano',
           'exports-loader',
           'file-loader',
           'html-webpack-plugin',
           'json-loader',
           'karma-sourcemap-loader',
           'less-loader',
+          'postcss-import',
           'postcss-loader',
           'postcss-url',
           'raw-loader',
@@ -582,7 +601,6 @@ export default Task.extend({
           'stylus-loader',
           'url-loader',
           'circular-dependency-plugin',
-          'webpack-concat-plugin',
           'copy-webpack-plugin',
           'uglifyjs-webpack-plugin',
         ].forEach((packageName: string) => {

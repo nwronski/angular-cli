@@ -1,6 +1,6 @@
 import { ng } from '../../utils/process';
 import { updateJsonFile } from '../../utils/project';
-import { writeFile, appendToFile, readFile } from '../../utils/fs';
+import { writeFile, appendToFile, readFile, replaceInFile } from '../../utils/fs';
 import { getGlobalVariable } from '../../utils/env';
 import { expectToFail } from '../../utils/utils';
 
@@ -15,13 +15,14 @@ export default function () {
   if (process.platform.startsWith('win')) {
     return Promise.resolve();
   }
+
   // Skip this in ejected tests.
   if (getGlobalVariable('argv').eject) {
     return Promise.resolve();
   }
 
-  // Skip in non-nightly tests. Switch this check around when ng5 is out.
-  if (!getGlobalVariable('argv').nightly) {
+  // Skip this test in Angular 2/4.
+  if (getGlobalVariable('argv').ng2 || getGlobalVariable('argv').ng4) {
     return Promise.resolve();
   }
 
@@ -38,7 +39,7 @@ export default function () {
     }))
     .then(() => expectToFail(() => ng('build')))
     .then(({ message }) => {
-      if (!message.includes('polyfills.ts is not part of the compilation')) {
+      if (!message.includes('polyfills.ts is missing from the TypeScript compilation')) {
         throw new Error(`Expected missing TS file error, got this instead:\n${message}`);
       }
       if (extraErrors.some((e) => message.includes(e))) {
@@ -61,11 +62,12 @@ export default function () {
       }
     })
     .then(() => writeFile('./src/app/app.component.ts', origContent))
-    // Check errors when files were not emitted.
-    .then(() => writeFile('./src/app/app.component.ts', ''))
+    // Check errors when files were not emitted due to static analysis errors.
+    .then(() => replaceInFile('./src/app/app.component.ts', `'app-root'`, `(() => 'app-root')()`))
     .then(() => expectToFail(() => ng('build', '--aot')))
     .then(({ message }) => {
-      if (!message.includes(`Unexpected value 'AppComponent`)) {
+      if (!message.includes('Function calls are not supported')
+        && !message.includes('Function expressions are not supported in decorators')) {
         throw new Error(`Expected static analysis error, got this instead:\n${message}`);
       }
       if (extraErrors.some((e) => message.includes(e))) {

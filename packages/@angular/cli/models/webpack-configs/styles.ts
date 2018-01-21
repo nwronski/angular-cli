@@ -6,12 +6,12 @@ import {
 import { extraEntryParser, getOutputHashFormat } from './utils';
 import { WebpackConfigOptions } from '../webpack-config';
 import { pluginArgs, postcssArgs } from '../../tasks/eject';
+import { CleanCssWebpackPlugin } from '../../plugins/cleancss-webpack-plugin';
 
-const cssnano = require('cssnano');
 const postcssUrl = require('postcss-url');
 const autoprefixer = require('autoprefixer');
 const ExtractTextPlugin = require('extract-text-webpack-plugin');
-const customProperties = require('postcss-custom-properties');
+const postcssImports = require('postcss-import');
 
 /**
  * Enumerate loaders and their dependencies from this file to let the dependency validator
@@ -29,6 +29,12 @@ const customProperties = require('postcss-custom-properties');
  * require('sass-loader')
  */
 
+interface PostcssUrlAsset {
+  url: string;
+  hash: string;
+  absolutePath: string;
+}
+
 export function getStylesConfig(wco: WebpackConfigOptions) {
   const { projectRoot, buildOptions, appConfig } = wco;
 
@@ -36,63 +42,96 @@ export function getStylesConfig(wco: WebpackConfigOptions) {
   const entryPoints: { [key: string]: string[] } = {};
   const globalStylePaths: string[] = [];
   const extraPlugins: any[] = [];
-  // style-loader does not support sourcemaps without absolute publicPath, so it's
-  // better to disable them when not extracting css
-  // https://github.com/webpack-contrib/style-loader#recommended-configuration
-  const cssSourceMap = buildOptions.extractCss && buildOptions.sourcemaps;
+  const cssSourceMap = buildOptions.sourcemaps;
 
+  // Maximum resource size to inline (KiB)
+  const maximumInlineSize = 10;
   // Minify/optimize css in production.
   const minimizeCss = buildOptions.target === 'production';
   // Convert absolute resource URLs to account for base-href and deploy-url.
   const baseHref = wco.buildOptions.baseHref || '';
   const deployUrl = wco.buildOptions.deployUrl || '';
 
-  const postcssPluginCreator = function() {
-    // safe settings based on: https://github.com/ben-eb/cssnano/issues/358#issuecomment-283696193
-    const importantCommentRe = /@preserve|@license|[@#]\s*source(?:Mapping)?URL|^!/i;
-    const minimizeOptions = {
-      autoprefixer: false, // full pass with autoprefixer is run separately
-      safe: true,
-      mergeLonghand: false, // version 3+ should be safe; cssnano currently uses 2.x
-      discardComments : { remove: (comment: string) => !importantCommentRe.test(comment) }
-    };
-
+  const postcssPluginCreator = function(loader: webpack.loader.LoaderContext) {
     return [
-      postcssUrl({
-        url: (URL: string) => {
-          // Only convert root relative URLs, which CSS-Loader won't process into require().
-          if (!URL.startsWith('/') || URL.startsWith('//')) {
-            return URL;
-          }
+      postcssImports({
+        resolve: (url: string, context: string) => {
+          return new Promise<string>((resolve, reject) => {
+            if (url && url.startsWith('~')) {
+              url = url.substr(1);
+            }
+            loader.resolve(context, url, (err: Error, result: string) => {
+              if (err) {
+                reject(err);
+                return;
+              }
 
-          if (deployUrl.match(/:\/\//)) {
-            // If deployUrl contains a scheme, ignore baseHref use deployUrl as is.
-            return `${deployUrl.replace(/\/$/, '')}${URL}`;
-          } else if (baseHref.match(/:\/\//)) {
-            // If baseHref contains a scheme, include it as is.
-            return baseHref.replace(/\/$/, '') +
-                `/${deployUrl}/${URL}`.replace(/\/\/+/g, '/');
-          } else {
-            // Join together base-href, deploy-url and the original URL.
-            // Also dedupe multiple slashes into single ones.
-            return `/${baseHref}/${deployUrl}/${URL}`.replace(/\/\/+/g, '/');
-          }
+              resolve(result);
+            });
+          });
+        },
+        load: (filename: string) => {
+          return new Promise<string>((resolve, reject) => {
+            loader.fs.readFile(filename, (err: Error, data: Buffer) => {
+              if (err) {
+                reject(err);
+                return;
+              }
+
+              const content = data.toString();
+              resolve(content);
+            });
+          });
         }
       }),
+      postcssUrl({
+        filter: ({ url }: PostcssUrlAsset) => url.startsWith('~'),
+        url: ({ url }: PostcssUrlAsset) => {
+          const fullPath = path.join(projectRoot, 'node_modules', url.substr(1));
+          return path.relative(loader.context, fullPath).replace(/\\/g, '/');
+        }
+      }),
+      postcssUrl([
+        {
+          // Only convert root relative URLs, which CSS-Loader won't process into require().
+          filter: ({ url }: PostcssUrlAsset) => url.startsWith('/') && !url.startsWith('//'),
+          url: ({ url }: PostcssUrlAsset) => {
+            if (deployUrl.match(/:\/\//) || deployUrl.startsWith('/')) {
+              // If deployUrl is absolute or root relative, ignore baseHref & use deployUrl as is.
+              return `${deployUrl.replace(/\/$/, '')}${url}`;
+            } else if (baseHref.match(/:\/\//)) {
+              // If baseHref contains a scheme, include it as is.
+              return baseHref.replace(/\/$/, '') +
+                  `/${deployUrl}/${url}`.replace(/\/\/+/g, '/');
+            } else {
+              // Join together base-href, deploy-url and the original URL.
+              // Also dedupe multiple slashes into single ones.
+              return `/${baseHref}/${deployUrl}/${url}`.replace(/\/\/+/g, '/');
+            }
+          }
+        },
+        {
+          // TODO: inline .cur if not supporting IE (use browserslist to check)
+          filter: (asset: PostcssUrlAsset) => {
+            return maximumInlineSize > 0 && !asset.hash && !asset.absolutePath.endsWith('.cur');
+          },
+          url: 'inline',
+          // NOTE: maxSize is in KB
+          maxSize: maximumInlineSize,
+          fallback: 'rebase',
+        },
+        { url: 'rebase' },
+      ]),
       autoprefixer(),
-      customProperties({ preserve: true})
-    ].concat(
-        minimizeCss ? [cssnano(minimizeOptions)] : []
-    );
+    ];
   };
   (postcssPluginCreator as any)[postcssArgs] = {
     variableImports: {
       'autoprefixer': 'autoprefixer',
       'postcss-url': 'postcssUrl',
-      'cssnano': 'cssnano',
-      'postcss-custom-properties': 'customProperties'
+      'postcss-import': 'postcssImports',
     },
-    variables: { minimizeCss, baseHref, deployUrl }
+    variables: { minimizeCss, baseHref, deployUrl, projectRoot, maximumInlineSize }
   };
 
   // determine hashing format
@@ -163,7 +202,7 @@ export function getStylesConfig(wco: WebpackConfigOptions) {
       loader: 'css-loader',
       options: {
         sourceMap: cssSourceMap,
-        importLoaders: 1
+        import: false,
       }
     },
     {
@@ -171,7 +210,8 @@ export function getStylesConfig(wco: WebpackConfigOptions) {
       options: {
         // A non-function property is required to workaround a webpack option handling bug
         ident: 'postcss',
-        plugins: postcssPluginCreator
+        plugins: postcssPluginCreator,
+        sourceMap: cssSourceMap
       }
     }
   ];
@@ -216,6 +256,10 @@ export function getStylesConfig(wco: WebpackConfigOptions) {
       new ExtractTextPlugin({ filename: `[name]${hashFormat.extract}.bundle.css` }));
     // suppress empty .js files in css only entry points
     extraPlugins.push(new SuppressExtractedTextChunksWebpackPlugin());
+  }
+
+  if (minimizeCss) {
+    extraPlugins.push(new CleanCssWebpackPlugin({ sourceMap: cssSourceMap }));
   }
 
   return {

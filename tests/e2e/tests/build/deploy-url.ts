@@ -1,29 +1,21 @@
 import { ng } from '../../utils/process';
+import { copyProjectAsset } from '../../utils/assets';
 import { expectFileToMatch, writeMultipleFiles } from '../../utils/fs';
 import { updateJsonFile } from '../../utils/project';
 import { getGlobalVariable } from '../../utils/env';
-import { stripIndents } from 'common-tags';
 
 
 export default function () {
-  // Skip this in Appveyor tests.
-  if (getGlobalVariable('argv').appveyor) {
-    return Promise.resolve();
-  }
-
-
   return Promise.resolve()
     .then(() => writeMultipleFiles({
-      'src/styles.css': 'div { background: url("./assets/more.svg"); }',
-      'src/assets/more.svg': stripIndents`
-        <svg width="100" height="100">
-          <circle cx="50" cy="50" r="40" stroke="green" stroke-width="4" fill="yellow" />
-        </svg>
-    `}))
+      'src/styles.css': 'div { background: url("./assets/more.png"); }',
+    }))
+    // use image with file size >10KB to prevent inlining
+    .then(() => copyProjectAsset('images/spectrum.png', './assets/more.png'))
     .then(() => ng('build', '--deploy-url=deployUrl/', '--extract-css'))
     .then(() => expectFileToMatch('dist/index.html', 'deployUrl/main.bundle.js'))
     // verify --deploy-url isn't applied to extracted css urls
-    .then(() => expectFileToMatch('dist/styles.bundle.css', /url\(more\.[0-9a-f]{20}\.svg\)/))
+    .then(() => expectFileToMatch('dist/styles.bundle.css', /url\(more\.[0-9a-f]{20}\.png\)/))
     .then(() => ng('build', '--deploy-url=http://example.com/some/path/', '--extract-css'))
     .then(() => expectFileToMatch('dist/index.html', 'http://example.com/some/path/main.bundle.js'))
     // verify option also works in config
@@ -36,5 +28,13 @@ export default function () {
     // verify --deploy-url is applied to non-extracted css urls
     .then(() => ng('build', '--deploy-url=deployUrl/', '--extract-css=false'))
     .then(() => expectFileToMatch('dist/styles.bundle.js',
-      /__webpack_require__.p \+ \"more\.[0-9a-f]{20}\.svg\"/));
+      /__webpack_require__.p \+ \"more\.[0-9a-f]{20}\.png\"/))
+    .then(() => expectFileToMatch('dist/inline.bundle.js',
+      /__webpack_require__\.p = "deployUrl\/";/))
+    // verify slash is appended to the end of --deploy-url if missing
+    .then(() => ng('build', '--deploy-url=deployUrl', '--extract-css=false'))
+    // skip this in ejected tests
+    .then(() => getGlobalVariable('argv').eject
+      ? Promise.resolve()
+      : expectFileToMatch('dist/inline.bundle.js', /__webpack_require__\.p = "deployUrl\/";/));
 }

@@ -2,13 +2,12 @@ import * as webpack from 'webpack';
 import * as path from 'path';
 import * as CopyWebpackPlugin from 'copy-webpack-plugin';
 import { NamedLazyChunksWebpackPlugin } from '../../plugins/named-lazy-chunks-webpack-plugin';
-import { InsertConcatAssetsWebpackPlugin } from '../../plugins/insert-concat-assets-webpack-plugin';
 import { extraEntryParser, getOutputHashFormat, AssetPattern } from './utils';
 import { isDirectory } from '../../utilities/is-directory';
 import { requireProjectModule } from '../../utilities/require-project-module';
 import { WebpackConfigOptions } from '../webpack-config';
+import { ScriptsWebpackPlugin } from '../../plugins/scripts-webpack-plugin';
 
-const ConcatPlugin = require('webpack-concat-plugin');
 const ProgressPlugin = require('webpack/lib/ProgressPlugin');
 const CircularDependencyPlugin = require('circular-dependency-plugin');
 const SilentError = require('silent-error');
@@ -67,23 +66,16 @@ export function getCommonConfig(wco: WebpackConfigOptions) {
 
     // Add a new asset for each entry.
     globalScriptsByEntry.forEach((script) => {
-      const hash = hashFormat.chunk !== '' && !script.lazy ? '.[hash]' : '';
-      extraPlugins.push(new ConcatPlugin({
-        uglify: buildOptions.target === 'production' ? { sourceMapIncludeSources: true } : false,
-        sourceMap: buildOptions.sourcemaps,
+      // Lazy scripts don't get a hash, otherwise they can't be loaded by name.
+      const hash = script.lazy ? '' : hashFormat.script;
+      extraPlugins.push(new ScriptsWebpackPlugin({
         name: script.entry,
-        // Lazy scripts don't get a hash, otherwise they can't be loaded by name.
-        fileName: `[name]${script.lazy ? '' : hash}.bundle.js`,
-        filesToConcat: script.paths
+        sourceMap: buildOptions.sourcemaps,
+        filename: `${script.entry}${hash}.bundle.js`,
+        scripts: script.paths,
+        basePath: projectRoot,
       }));
     });
-
-    // Insert all the assets created by ConcatPlugin in the right place in index.html.
-    extraPlugins.push(new InsertConcatAssetsWebpackPlugin(
-      globalScriptsByEntry
-        .filter((el) => !el.lazy)
-        .map((el) => el.entry)
-    ));
   }
 
   // process asset entries
@@ -93,14 +85,37 @@ export function getCommonConfig(wco: WebpackConfigOptions) {
       asset = typeof asset === 'string' ? { glob: asset } : asset;
       // Add defaults.
       // Input is always resolved relative to the appRoot.
-      asset.input = path.resolve(appRoot, asset.input || '');
+      asset.input = path.resolve(appRoot, asset.input || '').replace(/\\/g, '/');
       asset.output = asset.output || '';
       asset.glob = asset.glob || '';
 
-      // Prevent asset configurations from writing outside of the output path
-      const fullOutputPath = path.resolve(buildOptions.outputPath, asset.output);
-      if (!fullOutputPath.startsWith(path.resolve(buildOptions.outputPath))) {
-        const message = 'An asset cannot be written to a location outside of the output path.';
+      // Prevent asset configurations from writing outside of the output path, except if the user
+      // specify a configuration flag.
+      // Also prevent writing outside the project path. That is not overridable.
+      const absoluteOutputPath = path.resolve(buildOptions.outputPath);
+      const absoluteAssetOutput = path.resolve(absoluteOutputPath, asset.output);
+      const outputRelativeOutput = path.relative(absoluteOutputPath, absoluteAssetOutput);
+
+      if (outputRelativeOutput.startsWith('..') || path.isAbsolute(outputRelativeOutput)) {
+
+        const projectRelativeOutput = path.relative(projectRoot, absoluteAssetOutput);
+        if (projectRelativeOutput.startsWith('..') || path.isAbsolute(projectRelativeOutput)) {
+          const message = 'An asset cannot be written to a location outside the project.';
+          throw new SilentError(message);
+        }
+
+        if (!asset.allowOutsideOutDir) {
+          const message = 'An asset cannot be written to a location outside of the output path. '
+                        + 'You can override this message by setting the `allowOutsideOutDir` '
+                        + 'property on the asset to true in the CLI configuration.';
+          throw new SilentError(message);
+        }
+      }
+
+      // Prevent asset configurations from reading files outside of the project.
+      const projectRelativeInput = path.relative(projectRoot, asset.input);
+      if (projectRelativeInput.startsWith('..') || path.isAbsolute(projectRelativeInput)) {
+        const message = 'An asset cannot be read from a location outside the project.';
         throw new SilentError(message);
       }
 
@@ -114,16 +129,20 @@ export function getCommonConfig(wco: WebpackConfigOptions) {
         asset.glob = asset.glob + '/**/*';
       }
 
+      // Escape the input in case it has special charaters and use to make glob absolute
+      const escapedInput = asset.input
+        .replace(/[\\|\*|\?|\!|\(|\)|\[|\]|\{|\}]/g, (substring) => `\\${substring}`);
+
       return {
         context: asset.input,
         to: asset.output,
         from: {
-          glob: asset.glob,
+          glob: path.resolve(escapedInput, asset.glob),
           dot: true
         }
       };
     });
-    const copyWebpackPluginOptions = { ignore: ['.gitkeep'] };
+    const copyWebpackPluginOptions = { ignore: ['.gitkeep', '**/.DS_Store', '**/Thumbs.db'] };
 
     const copyWebpackPluginInstance = new CopyWebpackPlugin(copyWebpackPluginPatterns,
       copyWebpackPluginOptions);

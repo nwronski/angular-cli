@@ -109,10 +109,16 @@ export default Command.extend({
         schematicName,
         collectionName
       })
-      .then((availableOptions: SchematicAvailableOptions) => {
+      .then((availableOptions: SchematicAvailableOptions[]) => {
         let anonymousOptions: string[] = [];
+
+        const nameOption = availableOptions.filter(opt => opt.name === 'name')[0];
+        if (nameOption) {
+          anonymousOptions = [...anonymousOptions, '<name>'];
+        }
+
         if (collectionName === '@schematics/angular' && schematicName === 'interface') {
-          anonymousOptions = ['<type>'];
+          anonymousOptions = [...anonymousOptions, '<type>'];
         }
 
         this.registerOptions({
@@ -127,8 +133,12 @@ export default Command.extend({
       throw 'The `ng generate module` command requires a name to be specified.';
     }
 
-    const entityName = rawArgs[1];
-    commandOptions.name = stringUtils.dasherize(entityName.split(separatorRegEx).pop());
+    let entityName = rawArgs[1];
+    if (entityName) {
+      commandOptions.name = stringUtils.dasherize(entityName.split(separatorRegEx).pop());
+    } else {
+      entityName = '';
+    }
 
     const appConfig = getAppFromConfig(commandOptions.app);
     const dynamicPathOptions: DynamicPathOptions = {
@@ -138,15 +148,15 @@ export default Command.extend({
       dryRun: commandOptions.dryRun
     };
     const parsedPath = dynamicPathParser(dynamicPathOptions);
-    commandOptions.sourceDir = appConfig.root;
-    const root = appConfig.root + path.sep;
-    commandOptions.appRoot = parsedPath.appRoot === appConfig.root ? '' :
+    commandOptions.sourceDir = parsedPath.sourceDir.replace(separatorRegEx, '/');
+    const root = parsedPath.sourceDir + path.sep;
+    commandOptions.appRoot = parsedPath.appRoot === parsedPath.sourceDir ? '' :
       parsedPath.appRoot.startsWith(root)
         ? parsedPath.appRoot.substr(root.length)
         : parsedPath.appRoot;
 
     commandOptions.path = parsedPath.dir.replace(separatorRegEx, '/');
-    commandOptions.path = parsedPath.dir === appConfig.root ? '' :
+    commandOptions.path = parsedPath.dir === parsedPath.sourceDir ? '' :
       parsedPath.dir.startsWith(root)
         ? commandOptions.path.substr(root.length)
         : commandOptions.path;

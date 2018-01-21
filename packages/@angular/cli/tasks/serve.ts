@@ -73,8 +73,8 @@ export default Task.extend({
     }
 
     const serveDefaults = {
-      // default deployUrl to '' on serve to prevent the default from .angular-cli.json
-      deployUrl: ''
+      deployUrl: appConfig.deployUrl || '',
+      baseHref: appConfig.baseHref || '',
     };
 
     serveTaskOptions = Object.assign({}, serveDefaults, serveTaskOptions);
@@ -108,18 +108,18 @@ export default Task.extend({
 
     if (serveTaskOptions.liveReload) {
       // This allows for live reload of page when changes are made to repo.
-      // https://webpack.github.io/docs/webpack-dev-server.html#inline-mode
+      // https://webpack.js.org/configuration/dev-server/#devserver-inline
       let entryPoints = [
         `webpack-dev-server/client?${clientAddress}`
       ];
       if (serveTaskOptions.hmr) {
-        const webpackHmrLink = 'https://webpack.github.io/docs/hot-module-replacement.html';
+        const webpackHmrLink = 'https://webpack.js.org/guides/hot-module-replacement';
 
         ui.writeLine(oneLine`
           ${yellow('NOTICE')} Hot Module Replacement (HMR) is enabled for the dev server.
         `);
 
-        const showWarning = CliConfig.fromGlobal().get('warnings.hmrWarning');
+        const showWarning = CliConfig.fromProject().get('warnings.hmrWarning');
         if (showWarning) {
           ui.writeLine('  The project will still live reload when HMR is enabled,');
           ui.writeLine('  but to take advantage of HMR additional application code is required');
@@ -127,7 +127,7 @@ export default Task.extend({
           ui.writeLine(`  See ${chalk.blue(webpackHmrLink)}`);
           ui.writeLine('  for information on working with HMR for Webpack.');
           ui.writeLine(oneLine`
-            ${yellow('To disable this warning use "ng set --global warnings.hmrWarning=false"')}
+            ${yellow('To disable this warning use "ng set warnings.hmrWarning=false"')}
           `);
         }
         entryPoints.push('webpack/hot/dev-server');
@@ -193,7 +193,8 @@ export default Task.extend({
     if (!servePath && servePath !== '') {
       const defaultServePath =
         findDefaultServePath(serveTaskOptions.baseHref, serveTaskOptions.deployUrl);
-      if (defaultServePath == null) {
+      const showWarning = CliConfig.fromProject().get('warnings.servePathDefault');
+      if (defaultServePath == null && showWarning) {
         ui.writeLine(oneLine`
             ${chalk.yellow('WARNING')} --deploy-url and/or --base-href contain
             unsupported values for ng serve.  Default serve path of '/' used.
@@ -246,7 +247,7 @@ export default Task.extend({
         This is a simple server for use in testing or debugging Angular applications locally.
         It hasn't been reviewed for security issues.
 
-        DON'T USE IT FOR PRODUCTION USE!
+        DON'T USE IT FOR PRODUCTION!
         ****************************************************************************************
       `));
     }

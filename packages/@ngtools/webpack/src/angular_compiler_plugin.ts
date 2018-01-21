@@ -19,14 +19,16 @@ import {
 import { resolveEntryModuleFromMain } from './entry_resolver';
 import {
   replaceBootstrap,
+  replaceServerBootstrap,
   exportNgFactory,
   exportLazyModuleMap,
+  removeDecorators,
   registerLocaleData,
   findResources,
   replaceResources,
 } from './transformers';
 import { time, timeEnd } from './benchmark';
-import { InitMessage, UpdateMessage } from './type_checker';
+import { InitMessage, UpdateMessage, AUTO_START_ARG } from './type_checker';
 import { gatherDiagnostics, hasErrors } from './gather_diagnostics';
 import {
   CompilerCliIsSupported,
@@ -105,8 +107,9 @@ export class AngularCompilerPlugin implements Tapable {
   // Webpack plugin.
   private _firstRun = true;
   private _donePromise: Promise<void> | null;
-  private _compiler: any = null;
-  private _compilation: any = null;
+  private _normalizedLocale: string;
+  private _warnings: (string | Error)[] = [];
+  private _errors: (string | Error)[] = [];
 
   // TypeChecker process.
   private _forkTypeChecker = true;
@@ -132,9 +135,9 @@ export class AngularCompilerPlugin implements Tapable {
     if (!this._entryModule) {
       return undefined;
     }
-    const splitted = this._entryModule.split('#');
+    const splitted = this._entryModule.split(/(#[a-zA-Z_]([\w]+))$/);
     const path = splitted[0];
-    const className = splitted[1] || 'default';
+    const className = !!splitted[1] ? splitted[1].substring(1) : 'default';
     return { path, className };
   }
 
@@ -172,7 +175,7 @@ export class AngularCompilerPlugin implements Tapable {
     }
 
     this._rootNames = config.rootNames.concat(...this._singleFileIncludes);
-    this._compilerOptions = config.options;
+    this._compilerOptions = { ...config.options, ...options.compilerOptions };
     this._basePath = config.options.basePath;
 
     // Overwrite outDir so we can find generated files next to their .ts origin in compilerHost.
@@ -224,7 +227,9 @@ export class AngularCompilerPlugin implements Tapable {
       this._compilerOptions.i18nOutFormat = options.i18nOutFormat;
     }
     if (options.locale !== undefined) {
-      this._compilerOptions.i18nInLocale = this._validateLocale(options.locale);
+      this._compilerOptions.i18nInLocale = options.locale;
+      this._compilerOptions.i18nOutLocale = options.locale;
+      this._normalizedLocale = this._validateLocale(options.locale);
     }
     if (options.missingTranslation !== undefined) {
       this._compilerOptions.i18nInMissingTranslations =
@@ -444,7 +449,7 @@ export class AngularCompilerPlugin implements Tapable {
         if (moduleKey in this._lazyRoutes) {
           if (this._lazyRoutes[moduleKey] !== modulePath) {
             // Found a duplicate, this is an error.
-            this._compilation.warnings.push(
+            this._warnings.push(
               new Error(`Duplicated path in loadChildren detected during a rebuild. `
                 + `We will take the latest version detected and override it to save rebuild time. `
                 + `You should perform a full build to validate that your routes don't overlap.`)
@@ -462,7 +467,7 @@ export class AngularCompilerPlugin implements Tapable {
     const g: any = global;
     const typeCheckerFile: string = g['angularCliIsLocal']
       ? './type_checker_bootstrap.js'
-      : './type_checker.js';
+      : './type_checker_worker.js';
 
     const debugArgRegex = /--inspect(?:-brk|-port)?|--debug(?:-brk|-port)/;
 
@@ -471,21 +476,46 @@ export class AngularCompilerPlugin implements Tapable {
       // Workaround for https://github.com/nodejs/node/issues/9435
       return !debugArgRegex.test(arg);
     });
-
+    // Signal the process to start listening for messages
+    // Solves https://github.com/angular/angular-cli/issues/9071
+    const forkArgs = [AUTO_START_ARG];
     const forkOptions: ForkOptions = { execArgv };
 
-    this._typeCheckerProcess = fork(path.resolve(__dirname, typeCheckerFile), [], forkOptions);
+    this._typeCheckerProcess = fork(
+      path.resolve(__dirname, typeCheckerFile),
+      forkArgs,
+      forkOptions);
     this._typeCheckerProcess.send(new InitMessage(this._compilerOptions, this._basePath,
       this._JitMode, this._rootNames));
 
     // Cleanup.
     const killTypeCheckerProcess = () => {
-      treeKill(this._typeCheckerProcess.pid, 'SIGTERM');
+      if (this._typeCheckerProcess && this._typeCheckerProcess.pid) {
+        treeKill(this._typeCheckerProcess.pid, 'SIGTERM');
+        this._typeCheckerProcess = undefined;
+        this._forkTypeChecker = false;
+      }
+    };
+
+    // Handle child process exit.
+    const handleChildProcessExit = () => {
+      killTypeCheckerProcess();
+      const msg = 'AngularCompilerPlugin: Forked Type Checker exited unexpectedly. ' +
+        'Falling back to typechecking on main thread.';
+      this._warnings.push(msg);
+    };
+    this._typeCheckerProcess.once('exit', handleChildProcessExit);
+    this._typeCheckerProcess.once('SIGINT', handleChildProcessExit);
+    this._typeCheckerProcess.once('uncaughtException', handleChildProcessExit);
+
+    // Handle parent process exit.
+    const handleParentProcessExit = () => {
+      killTypeCheckerProcess();
       process.exit();
     };
-    process.once('exit', killTypeCheckerProcess);
-    process.once('SIGINT', killTypeCheckerProcess);
-    process.once('uncaughtException', killTypeCheckerProcess);
+    process.once('exit', handleParentProcessExit);
+    process.once('SIGINT', handleParentProcessExit);
+    process.once('uncaughtException', handleParentProcessExit);
   }
 
   private _updateForkedTypeChecker(rootNames: string[], changedCompilationFiles: string[]) {
@@ -495,8 +525,6 @@ export class AngularCompilerPlugin implements Tapable {
 
   // Registration hook for webpack plugin.
   apply(compiler: any) {
-    this._compiler = compiler;
-
     // Decorate inputFileSystem to serve contents of CompilerHost.
     // Use decorated inputFileSystem in watchFileSystem.
     compiler.plugin('environment', () => {
@@ -570,7 +598,6 @@ export class AngularCompilerPlugin implements Tapable {
     });
     compiler.plugin('done', () => {
       this._donePromise = null;
-      this._compilation = null;
     });
 
     // TODO: consider if it's better to remove this plugin and instead make it wait on the
@@ -580,9 +607,9 @@ export class AngularCompilerPlugin implements Tapable {
       // Wait for the plugin to be done when requesting `.ts` files directly (entry points), or
       // when the issuer is a `.ts` or `.ngfactory.js` file.
       compiler.resolvers.normal.plugin('before-resolve', (request: any, cb: () => void) => {
-        if (request.request.endsWith('.ts')
-          || (request.context.issuer && /\.ts|ngfactory\.js$/.test(request.context.issuer))) {
-          this.done!.then(() => cb(), () => cb());
+        if (this.done && (request.request.endsWith('.ts')
+          || (request.context.issuer && /\.ts|ngfactory\.js$/.test(request.context.issuer)))) {
+          this.done.then(() => cb(), () => cb());
         } else {
           cb();
         }
@@ -601,14 +628,13 @@ export class AngularCompilerPlugin implements Tapable {
 
   private _make(compilation: any, cb: (err?: any, request?: any) => void) {
     time('AngularCompilerPlugin._make');
-    this._compilation = compilation;
     this._emitSkipped = true;
-    if (this._compilation._ngToolsWebpackPluginInstance) {
+    if (compilation._ngToolsWebpackPluginInstance) {
       return cb(new Error('An @ngtools/webpack plugin already exist for this compilation.'));
     }
 
     // Set a private variable for this plugin instance.
-    this._compilation._ngToolsWebpackPluginInstance = this;
+    compilation._ngToolsWebpackPluginInstance = this;
 
     // Update the resource loader with the new webpack compilation.
     this._resourceLoader.update(compilation);
@@ -621,13 +647,22 @@ export class AngularCompilerPlugin implements Tapable {
     this._donePromise = Promise.resolve()
       .then(() => this._update())
       .then(() => {
+        this.pushCompilationErrors(compilation);
         timeEnd('AngularCompilerPlugin._make');
         cb();
       }, (err: any) => {
         compilation.errors.push(err.stack);
+        this.pushCompilationErrors(compilation);
         timeEnd('AngularCompilerPlugin._make');
         cb();
       });
+  }
+
+  private pushCompilationErrors(compilation: any) {
+    compilation.errors.push(...this._errors);
+    compilation.warnings.push(...this._warnings);
+    this._errors = [];
+    this._warnings = [];
   }
 
   private _makeTransformers() {
@@ -637,29 +672,35 @@ export class AngularCompilerPlugin implements Tapable {
     const isMainPath = (fileName: string) => fileName === this._mainPath;
     const getEntryModule = () => this.entryModule;
     const getLazyRoutes = () => this._lazyRoutes;
+    const getTypeChecker = () => this._getTsProgram().getTypeChecker();
 
     if (this._JitMode) {
       // Replace resources in JIT.
       this._transformers.push(replaceResources(isAppPath));
+    } else {
+      // Remove unneeded angular decorators.
+      this._transformers.push(removeDecorators(isAppPath, getTypeChecker));
     }
 
     if (this._platform === PLATFORM.Browser) {
       // If we have a locale, auto import the locale data file.
       // This transform must go before replaceBootstrap because it looks for the entry module
       // import, which will be replaced.
-      if (this._compilerOptions.i18nInLocale) {
+      if (this._normalizedLocale) {
         this._transformers.push(registerLocaleData(isAppPath, getEntryModule,
-          this._compilerOptions.i18nInLocale));
+          this._normalizedLocale));
       }
 
       if (!this._JitMode) {
         // Replace bootstrap in browser AOT.
-        this._transformers.push(replaceBootstrap(isAppPath, getEntryModule));
+        this._transformers.push(replaceBootstrap(isAppPath, getEntryModule, getTypeChecker));
       }
     } else if (this._platform === PLATFORM.Server) {
       this._transformers.push(exportLazyModuleMap(isMainPath, getLazyRoutes));
       if (!this._JitMode) {
-        this._transformers.push(exportNgFactory(isMainPath, getEntryModule));
+        this._transformers.push(
+          exportNgFactory(isMainPath, getEntryModule),
+          replaceServerBootstrap(isMainPath, getEntryModule, getTypeChecker));
       }
     }
   }
@@ -723,18 +764,18 @@ export class AngularCompilerPlugin implements Tapable {
 
         if (errors.length > 0) {
           const message = formatDiagnostics(errors);
-          this._compilation.errors.push(message);
+          this._errors.push(message);
         }
 
         if (warnings.length > 0) {
           const message = formatDiagnostics(warnings);
-          this._compilation.warnings.push(message);
+          this._warnings.push(message);
         }
 
         this._emitSkipped = !emitResult || emitResult.emitSkipped;
 
         // Reset changed files on successful compilation.
-        if (!this._emitSkipped && this._compilation.errors.length === 0) {
+        if (!this._emitSkipped && this._errors.length === 0) {
           this._compilerHost.resetChangedFileTracker();
         }
         timeEnd('AngularCompilerPlugin._update');
@@ -783,16 +824,20 @@ export class AngularCompilerPlugin implements Tapable {
           .map((p) => this._compilerHost.denormalizePath(p));
       }
     } else {
-      // Check if the TS file exists.
-      if (fileName.endsWith('.ts') && !this._compilerHost.fileExists(fileName, false)) {
-        throw new Error(`${fileName} is not part of the compilation. `
-          + `Please make sure it is in your tsconfig via the 'files' or 'include' property.`);
-      }
+      // Check if the TS input file and the JS output file exist.
+      if ((fileName.endsWith('.ts') && !this._compilerHost.fileExists(fileName, false))
+        || !this._compilerHost.fileExists(outputFile, false)) {
+        let msg = `${fileName} is missing from the TypeScript compilation. `
+          + `Please make sure it is in your tsconfig via the 'files' or 'include' property.`;
 
-      // Check if the output file exists.
-      if (!this._compilerHost.fileExists(outputFile, false)) {
-        throw new Error(`${fileName} is not part of the compilation output. `
-          + `Please check the other error messages for details.`);
+        if (/(\\|\/)node_modules(\\|\/)/.test(fileName)) {
+          msg += '\nThe missing file seems to be part of a third party library. '
+            + 'TS files in published libraries are often a sign of a badly packaged library. '
+            + 'Please open an issue in the library repository to alert its author and ask them '
+            + 'to package the library using the Angular Package Format (https://goo.gl/jB3GVv).';
+        }
+
+        throw new Error(msg);
       }
 
       outputText = this._compilerHost.readFile(outputFile);

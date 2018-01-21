@@ -14,11 +14,6 @@ import { readNgVersion } from '../../utils/version';
 import { expectToFail } from '../../utils/utils';
 
 export default function () {
-  // Skip this in Appveyor tests.
-  if (getGlobalVariable('argv').appveyor) {
-    return Promise.resolve();
-  }
-
   // Skip this for ejected tests.
   if (getGlobalVariable('argv').eject) {
     return Promise.resolve();
@@ -28,6 +23,11 @@ export default function () {
 
   if (getGlobalVariable('argv').nightly) {
     platformServerVersion = 'github:angular/platform-server-builds';
+  }
+
+  // Skip this test in Angular 2/4.
+  if (getGlobalVariable('argv').ng2 || getGlobalVariable('argv').ng4) {
+    return Promise.resolve();
   }
 
   return Promise.resolve()
